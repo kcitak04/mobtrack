@@ -108,7 +108,12 @@ main{flex:1;min-height:0;position:relative}
 .grp{display:flex;gap:3px;flex:none}
 .tsel{flex:none;background:#08100d;color:var(--amber);border:1px solid var(--line);border-radius:4px;font:700 13px var(--font);padding:0 8px;min-height:38px}
 .tsel.wide{min-width:150px}
-#view-mixer,#view-file{grid-template-rows:minmax(0,1fr)}
+#view-mixer,#view-file,#view-rsmp{grid-template-rows:minmax(0,1fr)}
+.rsgrid{display:flex;flex-wrap:wrap;gap:6px}
+.rsgrid .param{width:118px;height:58px}
+.rsgrid .param.off{opacity:.35}
+.rscv{width:320px;max-width:100%;height:64px;background:#030605;border:1px solid var(--line);border-radius:4px}
+.btn.big{min-height:48px;font-size:15px;padding:0 18px}
 .strips{display:flex;overflow-x:auto;overflow-y:hidden;min-height:0;touch-action:pan-x}
 .strip{flex:none;width:172px;display:grid;grid-template-columns:1fr 1fr;grid-auto-rows:39px;gap:3px;padding:4px;
   border-right:1px solid var(--line);align-content:start;overflow-y:auto}
@@ -218,6 +223,7 @@ main{flex:1;min-height:0;position:relative}
       <div class="mixwrap"><div class="strips" id="strips"></div><div class="vbar" id="mix-vbar"><b></b></div></div>
       <div class="hbar" id="mix-hbar"><div class="lbls"></div><b></b></div>
     </section>
+    <section id="view-rsmp" class="view"><div class="filepane" id="rspane"></div></section>
     <section id="view-file" class="view"><div class="filepane" id="filepane"></div></section>
   </main>
   <div id="pad"></div>
@@ -2161,7 +2167,8 @@ let song = makeDefaultSong();
 const state = {
   tab: 'pattern', order: 0, row: 0, track: 0, field: 0, octave: 4, step: 1, inst: 1,
   edit: true, follow: true, view: 'full', noteLen: 0, loop: true, kitSlot: new Array(TRACKS).fill(1), sel: null, selMode: false,
-  padShown: { pattern: true, instr: false, mixer: false, file: false }, sidePage: 'edit', clip: null, playPos: null,
+  padShown: { pattern: true, instr: false, mixer: false, rsmp: false, file: false },
+  rs: { src: 0, tap: 1, range: 0, tail: 1, norm: 1, warp: 1, loop: 0, dest: 0, last: 0 }, sidePage: 'edit', clip: null, playPos: null,
   mute: new Array(TRACKS).fill(false), solo: new Array(TRACKS).fill(false),
   instPage: 0, waveMode: 'nav', snap: true, gainDb: 3, sliceN: 8, sliceSens: 50, sliceMin: 60,
 };
@@ -2201,6 +2208,7 @@ function afterHistory() {
   patView.dirty = true; waveView.dirty = true;
   renderParams(); refreshMixer(); refreshFile(); NumBox.all.forEach(n => n.refresh()); refreshAll();
   if (ui.mixScrollUpdate) ui.mixScrollUpdate();
+  refreshRs();
 }
 function patEntry(p, label = 'pattern edit') {
   let rows = p.rows, data = p.data.slice();
@@ -3296,27 +3304,43 @@ function setSong(s) {
 }
 // Offline render: the Player generates every event up front, then the same worklet + mixer graph
 // renders into an OfflineAudioContext (faster than realtime).
-async function renderSong(onProgress) {
-  const sr = 44100, pl = new Player();
-  pl.loop = false; pl.detectLoop = true; pl.start(song, 0, 0, 'song');
+// o (all optional, used by RESAMPLE): order/row/mode ('song' | 'pattern') start point, maxRows limit,
+// tail seconds after the last row, track (render one track only) with tap 'dry' | 'fx' | 'sends'
+async function renderSong(onProgress, o = {}) {
+  const sr = 44100, pl = new Player(), mode = o.mode || 'song';
+  pl.loop = false; pl.detectLoop = mode === 'song'; pl.start(song, o.order || 0, o.row || 0, mode);
   const evs = [], tempo = [];
   // 0.3s pre-roll: the compressor/limiter nodes start "cold" in a fresh offline context and would squash the
   // first hit; they settle during the silent pre-roll, which encodeWAV then cuts off
   const PREROLL = 0.3;
-  let t = PREROLL;
-  while (!pl.ended && t < 15 * 60) { pl.step(t, evs); tempo.push(...pl.tempoEv); pl.tempoEv.length = 0; t += pl.tickDur; }
+  let t = PREROLL, rows = 0;
+  while (!pl.ended && t < 15 * 60) {
+    if (o.maxRows && pl.tick === 0 && rows >= o.maxRows) break;
+    if (pl.step(t, evs)) rows++;
+    tempo.push(...pl.tempoEv); pl.tempoEv.length = 0; t += pl.tickDur;
+  }
   for (let c = 0; c < TRACKS; c++) evs.push({ t, k: 'off', ch: c });
-  const dur = t + 3 + Math.min(6, song.fx.revDecay);
+  const dur = t + (o.tail != null ? o.tail + 0.1 : 3 + Math.min(6, song.fx.revDecay));
   const ctx = new OfflineAudioContext(2, Math.ceil(dur * sr), sr);
   const eng = new AudioEngine();
   await eng.init(ctx);
   eng.loadSong();
+  let latency = 0.018;   // each DynamicsCompressor delays ~6ms: track comp + master comp + limiter
+  if (o.track != null) {   // one track only: silence the others, then tap the chosen point of its chain
+    const m = eng.mixer;
+    m.tracks.forEach((tr, i) => { tr.gate.gain.cancelScheduledValues(0); tr.gate.gain.value = i === o.track ? 1 : 0; });
+    if (o.tap !== 'sends') {
+      m.analyser.disconnect();
+      if (o.tap === 'dry') { eng.node.connect(ctx.destination, o.track, 0); latency = 0; }
+      else { m.tracks[o.track].pan.connect(ctx.destination); latency = 0.006; }
+    }
+  }
   for (const e of tempo) eng.mixer.setTempo(e.bpm, e.speed, e.t);
   eng.schedule(routeAuto(evs, eng.mixer, false));
   await eng.sync();   // make sure the worklet has every sample, instrument and event before rendering
   for (let s = 2; s < dur - 0.1; s += 2) ctx.suspend(s).then(() => { onProgress(s / dur); ctx.resume(); });
   const buf = await ctx.startRendering();
-  return { buf, songEnd: t, start: PREROLL - 0.02 };
+  return { buf, songEnd: t, start: PREROLL - 0.02, t0: PREROLL, latency, rows };
 }
 function encodeWAV(buf, minLen, startSec = 0) {
   const ch = buf.numberOfChannels, sr = buf.sampleRate, s0 = Math.round(startSec * sr);
@@ -3562,7 +3586,7 @@ window.addEventListener('pagehide', autosave);
 // 11. BUILD UI
 // =====================================================================
 let patView, waveView;
-const TABS = [{ id: 'pattern', label: 'PATT' }, { id: 'instr', label: 'INST' }, { id: 'mixer', label: 'MIX' }, { id: 'file', label: 'FILE' }];
+const TABS = [{ id: 'pattern', label: 'PATT' }, { id: 'instr', label: 'INST' }, { id: 'mixer', label: 'MIX' }, { id: 'rsmp', label: 'RSMP' }, { id: 'file', label: 'FILE' }];
 const ui = {};
 function play(mode) {
   if (!engine.ready) return;
@@ -3578,6 +3602,7 @@ function setTab(id) {
   if (id === 'instr') { waveView.dirty = true; renderParams(); refreshInstr(); }
   if (id === 'mixer') { refreshMixer(); requestAnimationFrame(ui.mixScrollUpdate); }
   if (id === 'file') refreshFile();
+  if (id === 'rsmp') refreshRs();
   refreshPad(); patView.dirty = true;
 }
 function buildTop() {
@@ -4093,6 +4118,110 @@ function updateMixerMeters() {
     set(ui.masterVu, ui.masterPk, ui.masterPk);
   }
 }
+// ---- resample view: render the master or one track into a new sample ----
+const RS_PARAMS = [
+  P('src', 'SOURCE', 0, 8, 0, { options: ['MASTER', 'TRACK 1', 'TRACK 2', 'TRACK 3', 'TRACK 4', 'TRACK 5', 'TRACK 6', 'TRACK 7', 'TRACK 8'] }),
+  P('tap', 'TRACK SIGNAL', 0, 2, 1, { options: ['DRY', '+INSERT/EQ', '+SENDS'] }),
+  P('range', 'RANGE', 0, 2, 0, { options: ['PATTERN', 'SONG', 'SELECTION'] }),
+  P('tail', 'TAIL', 0, 8, 1, { unit: 's' }),
+  P('norm', 'NORMALIZE', 0, 1, 1, { options: ['OFF', 'ON'] }),
+  P('warp', 'AUTO WARP', 0, 1, 1, { options: ['OFF', 'ON'] }),
+  P('loop', 'LOOP', 0, 1, 0, { options: ['OFF', 'ON'] }),
+  P('dest', 'PUT INTO', 0, 1, 0, { options: ['NEW INSTR', 'CURRENT'] }),
+];
+function buildResample() {
+  const pane = $('#rspane'), bind = mixBind(() => state.rs, () => { }, () => refreshRs());
+  ui.rsBoxes = RS_PARAMS.map(pd => new ParamBox(pd, bind));
+  ui.rsInfo = el('span', { class: 'fnote' }); ui.rsStatus = el('span', { class: 'fnote' });
+  ui.rsGo = btn('● RESAMPLE', doResample, 'rec on big');
+  ui.rsCanvas = el('canvas', { class: 'rscv', width: 640, height: 128 });
+  ui.rsPlay = btn('▶ PLAY', () => { }, 'amber');
+  ui.rsPlay.addEventListener('pointerdown', e => {
+    e.preventDefault(); const id = state.rs.last, ins = id && song.instruments[id];
+    if (!ins || !engine.ready) return;
+    ui.rsPlay.setPointerCapture(e.pointerId);
+    engine.noteOn(PREVIEW_CH0, id, ins.p.root != null ? ins.p.root : 48, 0);
+  });
+  const stopPrev = () => engine.ready && engine.noteOff(PREVIEW_CH0);
+  ui.rsPlay.addEventListener('pointerup', stopPrev); ui.rsPlay.addEventListener('pointercancel', stopPrev);
+  ui.rsEdit = btn('EDIT IN INST', () => { if (state.rs.last) { selectInst(state.rs.last); setTab('instr'); } }, 'cyan');
+  pane.append(
+    el('div', { class: 'frow' }, el('h3', { text: 'RESAMPLE' }),
+      el('span', { class: 'fnote', text: 'Render the master or one track into a new sample, offline and faster than realtime. Undo removes it again.' })),
+    el('div', { class: 'rsgrid' }, ...ui.rsBoxes.map(b => b.el)),
+    el('div', { class: 'frow' }, ui.rsGo, ui.rsInfo),
+    el('div', { class: 'frow' }, ui.rsCanvas, ui.rsPlay, ui.rsEdit, ui.rsStatus));
+}
+function rsRangeRows() {
+  const rs = state.rs, sel = selRect(false);
+  if (rs.range === 0) return curPat().rows;
+  if (rs.range === 1) return song.order.reduce((a, pi) => a + (song.patterns[pi] ? song.patterns[pi].rows : 0), 0);
+  return sel ? sel.r1 - sel.r0 + 1 : 0;
+}
+function refreshRs() {
+  if (!ui.rsBoxes) return;
+  const rs = state.rs;
+  ui.rsBoxes.forEach(b => b.refresh());
+  ui.rsBoxes[1].el.classList.toggle('off', rs.src === 0);   // track signal only matters for a track
+  const rows = rsRangeRows(), secs = rows * song.speed * 2.5 / song.bpm;
+  const what = rs.src ? 'TRACK ' + rs.src + ' (' + ['dry', 'with insert/EQ/comp', 'with sends'][rs.tap] + ')' : 'MASTER';
+  const range = rs.range === 0 ? 'pattern ' + hex(curPatIndex()) : rs.range === 1 ? 'whole song' : rows ? 'rows ' + hex(selRect(false).r0) + '-' + hex(selRect(false).r1) : 'no rows selected';
+  const dest = rs.dest ? 'instrument ' + hex(state.inst) + ' (replaced)' : (freeInst() ? 'new instrument ' + hex(freeInst()) : 'no free instrument!');
+  ui.rsInfo.textContent = what + '  ·  ' + range + '  ·  ' + (rows ? secs.toFixed(2) + 's' + (rs.tail ? ' + ' + rs.tail + 's tail' : '') : '') + '  →  ' + dest;
+  // result preview
+  const g = ui.rsCanvas.getContext('2d'), W = ui.rsCanvas.width, H = ui.rsCanvas.height, ins = rs.last && song.instruments[rs.last], s = ins && instSample(ins);
+  g.fillStyle = '#030605'; g.fillRect(0, 0, W, H);
+  ui.rsPlay.hidden = ui.rsEdit.hidden = !s;
+  if (!s && ui.rsStatus.textContent.startsWith('Created')) ui.rsStatus.textContent = '';   // undone
+  if (!s) { g.fillStyle = C.num; g.font = 'bold 22px ' + getComputedStyle(document.body).fontFamily; g.fillText('result appears here', 16, H / 2 + 8); return; }
+  const pk = s.peaks[0], blocks = pk.mn.length, mid = H / 2;
+  g.fillStyle = C.wave;
+  for (let x = 0; x < W; x++) {
+    const b0 = Math.floor(x / W * blocks), b1 = Math.max(b0 + 1, Math.floor((x + 1) / W * blocks));
+    let lo = 1, hi = -1;
+    for (let b = b0; b < b1 && b < blocks; b++) { lo = Math.min(lo, pk.mn[b]); hi = Math.max(hi, pk.mx[b]); }
+    if (hi >= lo) g.fillRect(x, mid - hi * mid * 0.95, 1, Math.max(1, (hi - lo) * mid * 0.95));
+  }
+  g.fillStyle = '#ffd24a'; g.font = 'bold 20px ' + getComputedStyle(document.body).fontFamily; g.fillText(hex(rs.last) + ' ' + ins.name, 10, 24);
+}
+async function doResample() {
+  if (!engine.ready) return toast('Tap START first');
+  if (ui.rendering) return;
+  const rs = state.rs, sel = selRect(false), o = { tail: rs.tail };
+  if (rs.range === 0) Object.assign(o, { order: state.order, row: 0, mode: 'pattern' });
+  else if (rs.range === 1) Object.assign(o, { order: 0, row: 0, mode: 'song' });
+  else {
+    if (!sel) return toast('Select rows in the pattern first (SEL, then drag)');
+    Object.assign(o, { order: state.order, row: sel.r0, mode: 'pattern', maxRows: sel.r1 - sel.r0 + 1 });
+  }
+  if (rs.src > 0) { o.track = rs.src - 1; o.tap = ['dry', 'fx', 'sends'][rs.tap]; }
+  const idx = rs.dest === 1 ? state.inst : freeInst();
+  if (!idx) return toast('No free instrument slot (all 64 are used)');
+  if (sched.playing) stop();
+  ui.rendering = true; ui.rsGo.classList.add('dis');
+  try {
+    ui.rsStatus.textContent = 'Rendering...';
+    const r = await renderSong(p => ui.rsStatus.textContent = 'Rendering ' + Math.round(p * 100) + '%', o);
+    const sr = r.buf.sampleRate, s0 = Math.round((r.t0 + r.latency) * sr);
+    const n = Math.max(64, Math.min(r.buf.length - s0, Math.round((r.songEnd - r.t0 + rs.tail) * sr)));
+    const ch = [0, 1].map(c => r.buf.getChannelData(c).slice(s0, s0 + n));
+    let pk = 0;
+    for (const d of ch) for (let i = 0; i < n; i++) pk = Math.max(pk, Math.abs(d[i]));
+    if (pk < 1e-5) { ui.rsStatus.textContent = 'Nothing audible in that range (muted track or no notes?)'; return; }
+    if (rs.norm) { const g = 0.99 / pk; for (const d of ch) for (let i = 0; i < n; i++) d[i] *= g; }
+    const label = (rs.src ? 'T' + rs.src : 'MST') + ' ' + ['P' + hex(curPatIndex()), 'SONG', 'SEL'][rs.range];
+    assignSample(idx, song.addSample(sr, ch, 'RS ' + label));   // undoable
+    const ins = song.instruments[idx], beatSec = 4 * song.speed * 2.5 / song.bpm;
+    if (rs.warp) { ins.p.warp = 1; ins.p.warpBeats = +(n / sr / beatSec).toFixed(4); }
+    if (rs.loop) ins.p.loopMode = 1;
+    engine.setInst(idx);
+    rs.last = idx;
+    ui.rsStatus.textContent = 'Created ' + hex(idx) + ' ' + ins.name + '  ·  ' + (n / sr).toFixed(2) + 's' + (rs.warp ? '  ·  ' + fmtParam({ fmt: 'beats' }, ins.p.warpBeats) : '');
+    refreshRs();
+  } catch (e) {
+    ui.rsStatus.textContent = 'Resample failed: ' + (e.message || e);
+  } finally { ui.rendering = false; ui.rsGo.classList.remove('dis'); }
+}
 // ---- file view ----
 function buildFile() {
   const fp = $('#filepane'), projIn = el('input', { type: 'file', id: 'projfile', hidden: '' }), modIn = el('input', { type: 'file', id: 'modfile', hidden: '' });
@@ -4310,6 +4439,10 @@ $('#helptext').innerHTML = `<b>MOBTRACK — quick reference</b>   (tap anywhere 
  FILTER, DRIVE, CRUSH, CHORUS, FLANGER, PHASER, TREMOLO, AUTOPAN, RINGMOD (+ FX MIX).  Master: EQ, comp, limiter.
  Delay time is synced to BPM/speed (4 rows = 1 beat) and follows Fxx changes.
 
+<b>RSMP</b>  resample the MASTER or one TRACK (DRY / +INSERT/EQ / +SENDS) over the PATTERN, SONG or SELECTED rows
+ into a sample: TAIL keeps release/echo (0 = exact loop length), NORMALIZE, AUTO WARP (stays in tempo), LOOP,
+ PUT INTO a new or the current instrument. PLAY previews it, EDIT IN INST opens it. UNDO removes it.
+
 <b>FILE</b>  SAVE/OPEN .mtk projects (samples included) · EXPORT WAV (offline render) · IMPORT/EXPORT .MOD
  Work is autosaved in this browser; the start screen offers to restore it.
 
@@ -4318,7 +4451,7 @@ $('#helptext').innerHTML = `<b>MOBTRACK — quick reference</b>   (tap anywhere 
 function boot() {
   patView = new PatternView($('#pat'));
   waveView = new WaveView($('#wave'));
-  buildTop(); buildSide(); buildPad(); buildInstr(); buildFile(); initMixScroll(); renderMixer();
+  buildTop(); buildSide(); buildPad(); buildInstr(); buildFile(); buildResample(); initMixScroll(); renderMixer();
   bindHScroll($('#top'), $('#topnav'));
   // web version only: the Android app already ships all files inside the APK
   if (!window.AndroidBridge && 'serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('sw.js').catch(() => { });
