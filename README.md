@@ -11,8 +11,17 @@ Built for Chrome on Android in landscape, and it also runs in desktop Chrome.
 
 Audio runs in an AudioWorklet driven by a lookahead scheduler.
 
+## Install on Android
+
+1. Open https://kcitak04.github.io/mobtrack/ in Chrome.
+2. Tap **INSTALL APP** in the FILE tab, or Chrome menu ⋮ → **Install app**.
+3. Launch **MOBTRACK** from the app drawer. It runs full screen and works offline.
+
+The installed app updates itself the next time it starts online.
+
 ## Use
 
-Open the GitHub Pages URL in Chrome, rotate to landscape and tap **TAP TO START**. Tap **?** for the controls and the effect list.
+Tap **TAP TO START**, then **?** for the controls and the effect list.
+The page also runs in desktop Chrome, and `tracker.html` opens straight from disk.
 
 Songs, samples and autosaves stay on your device and are never uploaded anywhere.
