@@ -20,7 +20,18 @@ html,body{margin:0;height:100%;background:var(--bg);color:var(--text);font-famil
   padding:0 env(safe-area-inset-right,0px) 0 env(safe-area-inset-left,0px)}
 .bar{display:flex;gap:3px;align-items:stretch;flex:none;overflow-x:auto;overflow-y:hidden;scrollbar-width:none}
 .bar::-webkit-scrollbar{display:none}
-#top{height:46px;padding:3px;background:var(--panel);border-bottom:1px solid var(--line)}
+#top{height:46px;padding:3px;background:var(--panel);border-bottom:1px solid var(--line);touch-action:none}
+/* independent scroll bar for the top bar (swiping the buttons never scrolls, so no accidental presses) */
+.topnav{flex:none;height:16px;position:relative;background:#08100d;border-bottom:1px solid var(--line);touch-action:none}
+.topnav b{position:absolute;top:2px;bottom:2px;border:2px solid var(--acc);border-radius:4px;background:rgba(57,255,136,.16);pointer-events:none}
+/* typed value entry */
+.vover{position:fixed;inset:0;background:#000a;z-index:60;display:flex;justify-content:center;align-items:flex-start;padding:10px 16px}
+.vpop{background:var(--panel);border:1px solid var(--acc);border-radius:8px;padding:10px 12px;display:flex;flex-wrap:wrap;gap:8px;align-items:center;max-width:100%;box-shadow:0 8px 30px #000}
+.vpop .vl{color:var(--amber);font-weight:700;font-size:14px;letter-spacing:1px}
+.vin{font:700 20px var(--font);background:#08100d;color:var(--acc);border:1px solid var(--line);border-radius:4px;padding:6px 10px;width:150px}
+.vin.bad{border-color:var(--red)}
+.vpop .vh{color:var(--dim);font-size:11px;flex-basis:100%}
+.vpop .vb{display:flex;gap:6px;flex-basis:100%;justify-content:flex-end}
 .btn{flex:none;min-width:44px;min-height:38px;padding:0 8px;background:var(--panel2);color:var(--text);
   border:1px solid var(--line);border-radius:4px;font:700 12px var(--font);letter-spacing:.5px;display:flex;
   align-items:center;justify-content:center;white-space:nowrap;cursor:pointer}
@@ -183,6 +194,7 @@ main{flex:1;min-height:0;position:relative}
 <body>
 <div id="app">
   <header id="top" class="bar"></header>
+  <div id="topnav" class="topnav"><b></b></div>
   <main>
     <section id="view-pattern" class="view on">
       <div class="cwrap" id="pat-wrap"><canvas id="pat"></canvas></div>
@@ -2280,13 +2292,58 @@ function attachSlider(sl, onNorm, o = {}) {
   const up = e => { if (e.pointerId === id) { id = null; sl.classList.remove('act'); e.stopPropagation(); if (o.up) o.up(); } };
   sl.addEventListener('pointerup', up); sl.addEventListener('pointercancel', up);
 }
+// small popup to type an exact value: o = {label, value, hint, text, neg, def, parse(str)->value|null, onSet(value)}
+function openValueInput(o) {
+  closeValueInput();
+  const inp = el('input', { id: 'val-input', class: 'vin', value: o.value, inputmode: o.text ? 'text' : 'decimal', enterkeyhint: 'done', autocomplete: 'off', spellcheck: 'false' });
+  const ok = () => {
+    const v = o.parse(inp.value.trim());
+    if (v == null) { inp.classList.add('bad'); toast('Enter ' + o.hint); return; }
+    closeValueInput(); o.onSet(v);
+  };
+  // phone number pads often have no minus key: ± flips the sign
+  const sign = o.neg ? btn('±', () => { const t = inp.value.trim(); inp.value = t.startsWith('-') ? t.slice(1) : '-' + t; inp.focus(); }) : null;
+  const pop = el('div', { class: 'vpop' }, el('span', { class: 'vl', text: o.label }), inp, sign, el('span', { class: 'vh', text: o.hint }),
+    el('div', { class: 'vb' }, o.def != null ? btn('DEFAULT', () => { closeValueInput(); o.onSet(o.def); }, 'amber') : null,
+      btn('CANCEL', closeValueInput, 'red'), btn('OK', ok, 'on')));
+  const ov = el('div', { class: 'vover', id: 'vover' }, pop);
+  ov.addEventListener('pointerdown', e => { if (e.target === ov) closeValueInput(); });
+  inp.addEventListener('keydown', e => { if (e.key === 'Enter') ok(); else if (e.key === 'Escape') closeValueInput(); });
+  inp.addEventListener('input', () => inp.classList.remove('bad'));
+  document.body.append(ov);
+  inp.focus(); inp.select();
+}
+function closeValueInput() { const ov = $('#vover'); if (ov) ov.remove(); }
+// independent horizontal scroll bar for a row that does not scroll by swiping
+function bindHScroll(box, bar) {
+  const thumb = bar.querySelector('b');
+  const update = () => {
+    const W = box.scrollWidth, w = box.clientWidth, bw = bar.clientWidth;
+    bar.style.display = W > w + 2 ? '' : 'none';
+    thumb.style.left = (box.scrollLeft / W * bw) + 'px'; thumb.style.width = Math.max(30, w / W * bw) + 'px';
+  };
+  let id = null, p0 = 0, s0 = 0;
+  bar.addEventListener('pointerdown', e => {
+    e.preventDefault(); id = e.pointerId; bar.setPointerCapture(id);
+    const r = bar.getBoundingClientRect(), t = thumb.getBoundingClientRect();
+    if (e.clientX < t.left || e.clientX > t.right) box.scrollLeft = (e.clientX - r.left) / r.width * box.scrollWidth - box.clientWidth / 2;
+    p0 = e.clientX; s0 = box.scrollLeft;
+  });
+  bar.addEventListener('pointermove', e => { if (e.pointerId === id) box.scrollLeft = s0 + (e.clientX - p0) * box.scrollWidth / bar.getBoundingClientRect().width; });
+  const up = e => { if (e.pointerId === id) id = null; };
+  bar.addEventListener('pointerup', up); bar.addEventListener('pointercancel', up);
+  box.addEventListener('scroll', update);
+  new ResizeObserver(update).observe(box);
+  update();
+  return update;
+}
 function setSliderPos(fill, thumb, n) {
   const p = (clamp(n, 0, 1) * 100).toFixed(1) + '%';
   fill.style.width = p; thumb.style.left = `calc(6px + (100% - 12px) * ${clamp(n, 0, 1).toFixed(4)})`;
 }
 class NumBox {
   constructor(label, get, set, o = {}) {
-    this.get = get; this.set = set; this.o = Object.assign({ min: 0, max: 127, step: 1, px: 10, fmt: v => String(v) }, o);
+    this.get = get; this.set = set; this.label = label; this.o = Object.assign({ min: 0, max: 127, step: 1, px: 10, fmt: v => String(v) }, o);
     this.el = el('div', { class: 'num' + (o.cls ? ' ' + o.cls : '') }, el('span', { class: 'l', text: label }), this.val = el('span', { class: 'v' }),
       this.sl = el('div', { class: 'sl' }, el('div', { class: 'trk' }, this.fill = el('i')), this.thumb = el('b')));
     const span = () => this.o.max - this.o.min;
@@ -2301,11 +2358,21 @@ class NumBox {
       st.moved = true; this.apply(st.v + Math.round(d / this.o.px));
     });
     this.el.addEventListener('pointerup', e => {
-      if (st && !st.moved) { const r = this.el.getBoundingClientRect(); this.apply(this.get() + (e.clientX < r.left + r.width / 2 ? -1 : 1) * this.o.step); }
+      if (st && !st.moved) {
+        const r = this.el.getBoundingClientRect(), f = (e.clientX - r.left) / r.width;
+        if (f < 0.2 || f > 0.8) this.apply(this.get() + (f < 0.5 ? -1 : 1) * this.o.step);   // edges: step - / +
+        else { st = null; this.end(); return this.openInput(); }                              // middle: type a value
+      }
       st = null; this.end();
     });
     this.el.addEventListener('pointercancel', () => { st = null; this.end(); });
     NumBox.all.push(this); this.refresh();
+  }
+  openInput() {
+    const { min, max } = this.o;
+    openValueInput({ label: this.label, value: String(this.get()), hint: min + ' – ' + max, neg: min < 0, def: this.o.def,
+      parse: s => { const n = Math.round(parseFloat(s)); return isFinite(n) ? clamp(n, min, max) : null; },
+      onSet: v => { this.begin(); this.apply(v); this.end(); } });
   }
   // undo: o.hist = label records a value change; o.begin() lets the owner snapshot something itself
   begin() { this.before = this.get(); if (this.o.begin) this.o.begin(); }
@@ -2393,16 +2460,37 @@ class ParamBox {
     this.el.addEventListener('pointerup', e => {
       if (!st) return;
       if (!st.moved) {
-        const v = this.val(), now = performance.now();
-        if (pd.options) this.setV((v + 1) % pd.options.length);
-        else if (pd.int) { const r = this.el.getBoundingClientRect(); this.setV(clamp(v + (e.clientX < r.left + r.width / 2 ? -1 : 1), pd.min, this.max())); }
-        else if (now - lastTap < 350) this.setV(pd.max === 'len' ? 0 : pd.def);
-        lastTap = now;
+        const v = this.val(), r = this.el.getBoundingClientRect(), f = (e.clientX - r.left) / r.width;
+        if (pd.options) this.setV((v + 1) % pd.options.length);                                      // choices: tap cycles
+        else if (pd.int && (f < 0.2 || f > 0.8)) this.setV(clamp(v + (f < 0.5 ? -1 : 1), pd.min, this.max()));
+        else { st = null; this.end(); return this.openInput(); }                                      // type a value
       }
       st = null; this.end();
     });
     this.el.addEventListener('pointercancel', () => { st = null; this.end(); });
     this.refresh();
+  }
+  // typed entry, in the unit the box shows (seconds, Hz, dB, %, note names, hex volume ...)
+  openInput() {
+    const pd = this.pd, max = this.max(), v = this.val(), s = instSample(this.ins()), sr = s ? s.sr : 44100;
+    const num = t => { const n = parseFloat(String(t).replace(',', '.')); return isFinite(n) ? n : null; };
+    const fin = n => n == null ? null : clamp(pd.int ? Math.round(n) : n, pd.min, max);
+    let shown, hint, parse, text = false;
+    switch (pd.fmtFn ? 'pct' : pd.fmt) {
+      case 'pct': shown = Math.round(v * 100); hint = '0 – 100 %'; parse = t => { const n = num(t); return n == null ? null : clamp(n / 100, 0, 1); }; break;
+      case 'pan': shown = Math.round(v * 100); hint = '-100 (left) – 100 (right)'; parse = t => { const n = num(t); return n == null ? null : clamp(n / 100, -1, 1); }; break;
+      case 'frames': shown = (v / sr).toFixed(3); hint = 'seconds, 0 – ' + (max / sr).toFixed(3); parse = t => { const n = num(t); return n == null ? null : clamp(Math.round(n * sr), 0, max); }; break;
+      case 'note': text = true; shown = noteName(v); hint = 'note like C-4 or F#3, or 0 – 119';
+        parse = t => { t = t.toUpperCase().replace(/^([A-G])(\d)$/, '$1-$2'); return /^[A-G][-#]\d$/.test(t) && NOTE_NAMES.includes(t.slice(0, 2)) ? fin(parseNote(t)) : fin(num(t)); }; break;
+      case 'hexvol': text = true; shown = hex(v); hint = 'hex 01 – 40'; parse = t => { const n = parseInt(t, 16); return isFinite(n) ? fin(n) : null; }; break;
+      case 'time': shown = +(+v).toFixed(4); hint = 'seconds, ' + pd.min + ' – ' + max; parse = t => fin(num(t)); break;
+      default: {
+        const unit = pd.unit ? ' ' + pd.unit : pd.fmt === 'hz' || pd.fmt === 'srate' ? ' Hz' : pd.fmt === 'db' ? ' dB' : pd.fmt === 'bits' ? ' bits' : '';
+        shown = pd.int ? v : +(+v).toFixed(3); hint = pd.min + ' – ' + max + unit; parse = t => fin(num(t));
+      }
+    }
+    const def = pd.max === 'len' ? (/End$/.test(pd.key) ? max : 0) : pd.def;
+    openValueInput({ label: pd.label, value: String(shown), hint, text, neg: pd.min < 0, def, parse, onSet: val => { this.begin(); this.setV(val); this.end(); } });
   }
   begin() { this.h = { tgt: this.b.target(), before: this.val() }; }
   end() {
@@ -3939,8 +4027,9 @@ $('#helptext').innerHTML = `<b>MOBTRACK — quick reference</b>   (tap anywhere 
 <b>INSTRUMENT</b>  LOAD (wav/mp3/ogg) or REC (mic).  Waveform: pinch = zoom, drag = pan (NAV) or select (SELECT)
  Drag the flags: S/E = start/end (top), LS/LE = loop (bottom).  SNAP0 snaps markers to zero crossings.
  Destructive edits act on the selection (or the whole sample); TRIM keeps selection or S..E.  UNDO per sample.
- Param boxes: drag the slider bar sideways (taps never move it), or drag the box up/down. Double-tap resets,
- integer params: tap left/right half = -/+.  In MIX only the slider bars edit; move around with the bars at the
+ Param boxes: drag the slider bar sideways (taps never move it), or drag the box up/down.
+ Tap the middle of any value box (BPM, SPEED, params...) to TYPE a value (OK / DEFAULT / CANCEL, ± for minus);
+ tap the left / right edge of a number to step - / +.  The top bar scrolls only with the thin bar under it.  In MIX only the slider bars edit; move around with the bars at the
  bottom (tap T1-T8 / MST / REV / DLY to jump) and on the right.
 
 <b>UNDO / REDO</b> (top bar) undo everything: pattern edits, values, sample edits, presets, instruments, order list.
@@ -3965,6 +4054,7 @@ function boot() {
   patView = new PatternView($('#pat'));
   waveView = new WaveView($('#wave'));
   buildTop(); buildSide(); buildPad(); buildInstr(); buildFile(); initMixScroll(); renderMixer();
+  bindHScroll($('#top'), $('#topnav'));
   refreshAll(); refreshUndoBtns();
   requestAnimationFrame(frame);
   let saved = null;
