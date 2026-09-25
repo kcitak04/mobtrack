@@ -5,6 +5,9 @@
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
 <meta name="theme-color" content="#050807">
 <meta name="mobile-web-app-capable" content="yes">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" type="image/png" href="icon-192.png">
+<link rel="apple-touch-icon" href="icon-192.png">
 <title>MOBTRACK</title>
 <style>
 :root{
@@ -4098,7 +4101,8 @@ function buildFile() {
     row('AUDIO', btn('EXPORT WAV', exportWav, 'amber'), ui.shareBtn, ui.wavStatus),
     row('MOD', btn('IMPORT .MOD', () => modIn.click(), 'cyan'), btn('EXPORT .MOD', exportModFile, 'amber'),
       el('span', { class: 'fnote', text: 'ProTracker M.K. (4 ch) or 8CHN. Sampler instruments 01-1F only; synths stay silent.' })),
-    row('AUTOSAVE', ui.restoreBtn, ui.autoStatus));
+    row('AUTOSAVE', ui.restoreBtn, ui.autoStatus),
+    row('APP', ui.installBtn = btn('INSTALL APP', installApp, 'on'), ui.appStatus = el('span', { class: 'fnote' })));
   projIn.addEventListener('change', async () => {
     const f = projIn.files[0]; projIn.value = ''; if (!f) return;
     try { setSong(songFromObj(JSON.parse(await f.text()))); toast('Opened ' + f.name); }
@@ -4110,8 +4114,24 @@ function buildFile() {
     catch (e) { toast('Could not import MOD: ' + e.message, 5000); }
   });
 }
+// ---- installable app (PWA): Chrome on Android installs it as a real app (icon, full screen, offline) ----
+let installEvt = null;
+const isInstalledApp = () => matchMedia('(display-mode: fullscreen), (display-mode: standalone)').matches;
+window.addEventListener('beforeinstallprompt', e => { e.preventDefault(); installEvt = e; refreshFile(); });
+window.addEventListener('appinstalled', () => { installEvt = null; toast('MOBTRACK is installed: open it from your app drawer'); refreshFile(); });
+async function installApp() {
+  if (!installEvt) return toast('Use the Chrome menu ⋮ → "Install app" (or "Add to Home screen")', 5000);
+  installEvt.prompt();
+  await installEvt.userChoice;
+  installEvt = null; refreshFile();
+}
 function refreshFile() {
   if (!ui.title) return;
+  ui.installBtn.hidden = !installEvt;
+  ui.appStatus.textContent = isInstalledApp() ? 'Running as an installed app (works offline).'
+    : installEvt ? 'Install MOBTRACK as an app: own icon, full screen, works offline.'
+    : location.protocol === 'https:' ? 'To install: Chrome menu ⋮ → "Install app" or "Add to Home screen".'
+    : 'Open the web version (https) in Chrome to install it as an app.';
   if (document.activeElement !== ui.title) ui.title.value = song.title;
   ui.autoStatus.textContent = lastAutosave ? 'Last autosave ' + new Date(lastAutosave).toLocaleTimeString() + ' (this browser only)'
     : 'Your work is autosaved in this browser every 30 s and when you leave the page.';
@@ -4282,6 +4302,7 @@ function boot() {
   waveView = new WaveView($('#wave'));
   buildTop(); buildSide(); buildPad(); buildInstr(); buildFile(); initMixScroll(); renderMixer();
   bindHScroll($('#top'), $('#topnav'));
+  if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('sw.js').catch(() => { });
   refreshAll(); refreshUndoBtns();
   requestAnimationFrame(frame);
   let saved = null;
