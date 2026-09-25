@@ -2,7 +2,7 @@
   "name": "MOBTRACK Tracker",
   "short_name": "MOBTRACK",
   "description": "8-track Amiga-style music tracker with sampler, synths, mixer and effects.",
-  "id": "./",
+  "id": "/mobtrack/",
   "start_url": "./",
   "scope": "./",
   "display": "fullscreen",
