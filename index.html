@@ -169,6 +169,11 @@ main{flex:1;min-height:0;position:relative}
 .hbar .lbls{position:absolute;inset:0 30px 0 0;display:flex}
 .hbar .lbls span{flex:1;text-align:center;line-height:34px;font-size:11px;font-weight:700;color:var(--dim);letter-spacing:1px}
 .btn.dis2{opacity:.4}
+.span2{grid-column:span 2}
+.btn.smp{background:#2a2410;color:#ffd24a;border-color:#ffd24a}
+.dhead #kit-add{color:#ffd24a;max-width:34%}
+.dial.smpmode .dt{color:#ffd24a}
+.dial.smpmode .dsl .trk i,.dial.smpmode .dsl b{background:#ffd24a}
 /* portrait: pattern above, tools below */
 @media (orientation:portrait){
   #view-pattern{grid-template-columns:minmax(0,1fr);grid-template-rows:minmax(0,1fr) auto}
@@ -875,8 +880,8 @@ class TrackerEngine extends AudioWorkletProcessor {
         const inst = this.insts.get(e.inst), prev = c.voice;
         if (prev && !prev.done) {
           // mono synths glide instead of retriggering; poly synths let the old note ring out
-          if (inst && prev.instId === e.inst && prev.legato && prev.legato(e)) { c.vol = e.vol; c.pan = e.pan || 0; return; }
-          if (prev.overlap) prev.release(); else prev.kill();
+          if (!e.mono && inst && prev.instId === e.inst && prev.legato && prev.legato(e)) { c.vol = e.vol; c.pan = e.pan || 0; return; }
+          if (prev.overlap && !e.mono) prev.release(); else prev.kill();   // mono (sample tracks): always cut
         }
         c.voice = null;
         if (!inst) return;
@@ -1422,6 +1427,70 @@ function applyAutoNow(r, raw) {
   autoUi = true;
 }
 let autoUi = false;
+
+// ---- SAMPLE tracks: a per-track kit of samples; the INS column picks a kit slot (monophonic) ----
+const isSmpTrack = t => song.tracks[t].kind === 'sample';
+const kitInst = (t, slot) => song.tracks[t].kit[slot - 1] | 0;
+const kitSlot = t => state.kitSlot[t] || 1;
+function freeInst() {
+  for (let i = 1; i <= MAX_INST; i++) { const x = song.instruments[i]; if (x.type === 'sampler' && !x.sampleId && !x.name) return i; }
+  return 0;
+}
+function trackKindEntry(t, label) {
+  const tr = song.tracks[t], parts = song.patterns.map(p => patEntry(p));
+  parts.push(paramEntry({ obj: tr, apply() { } }, 'kind', tr.kind, ''), paramEntry({ obj: tr, apply() { } }, 'kit', tr.kit, ''));
+  return { label, swap() { parts.forEach(e => e.swap()); } };
+}
+// switching converts the existing notes: instrument numbers <-> kit slots
+function toggleTrackKind(t) {
+  const tr = song.tracks[t], toSample = tr.kind !== 'sample';
+  history.push(trackKindEntry(t, 'track ' + (t + 1) + ' type'));
+  const each = fn => { for (const p of song.patterns) for (let r = 0; r < p.rows; r++) fn(p, p.i(r, t)); };
+  if (toSample) {
+    const used = new Set();
+    each((p, o) => { if (p.data[o + 1] > 0) used.add(p.data[o + 1]); });
+    const kit = [...used].sort((a, b) => a - b).slice(0, 64), map = new Map(kit.map((id, k) => [id, k + 1]));
+    each((p, o) => { if (p.data[o + 1] > 0) p.data[o + 1] = map.get(p.data[o + 1]) || -1; });
+    tr.kit = kit; tr.kind = 'sample';
+    toast('Track ' + (t + 1) + ' is a SAMPLE track' + (kit.length ? ' (' + kit.length + ' samples in its kit)' : ''));
+  } else {
+    each((p, o) => {
+      const s = p.data[o + 1];
+      if (s > 0) {
+        const id = tr.kit[s - 1] | 0;
+        p.data[o + 1] = id > 0 ? id : -1;
+        if (id > 0 && p.data[o] < 0) p.data[o] = song.instruments[id].p.root != null ? song.instruments[id].p.root : 48;   // slot-only rows need a note on a synth track
+      }
+    });
+    tr.kind = 'synth';
+    toast('Track ' + (t + 1) + ' is a SYNTH track');
+  }
+  markDirty(); patView.dirty = true; refreshPad();
+}
+function kitAdd(t, id) {
+  const tr = song.tracks[t];
+  history.push(paramEntry({ obj: tr, apply() { } }, 'kit', tr.kit, 'add to kit'));
+  const k = tr.kit.slice(), free = k.indexOf(0);
+  if (free >= 0) k[free] = id; else k.push(id);
+  tr.kit = k; markDirty();
+  return (free >= 0 ? free : k.length - 1) + 1;
+}
+function kitRemove(t, slot) {
+  const tr = song.tracks[t];
+  if (!tr.kit[slot - 1]) return;
+  history.push(paramEntry({ obj: tr, apply() { } }, 'kit', tr.kit, 'remove from kit'));
+  const k = tr.kit.slice(); k[slot - 1] = 0;
+  while (k.length && !k[k.length - 1]) k.pop();
+  tr.kit = k; markDirty();
+}
+function previewKit(t, slot) {
+  const id = kitInst(t, slot);
+  if (!id || !engine.ready) return;
+  const I = song.instruments[id], ch = PREVIEW_CH0 + (previewNext++ % PREVIEW_CHS);
+  engine.noteOn(ch, id, I.p.root != null ? I.p.root : 48, t);
+  setTimeout(() => engine.noteOff(ch), 450);
+  if (state.inst !== id) { state.inst = id; engine.watch(id); ui.sideInst.textContent = hex(id) + ' ' + (I.name || '--'); waveView.fit(); }
+}
 function defaultParams(type) {
   const T = INSTRUMENT_TYPES[type], p = Object.assign({}, T.extra);
   for (const pg of T.pages) for (const d of pg.params || []) p[d.key] = d.max === 'len' ? 0 : d.def;
@@ -1436,7 +1505,8 @@ class Song {
     this.patterns = [new Pattern(64)]; this.order = [0];
     this.instruments = [null];
     for (let i = 1; i <= MAX_INST; i++) this.instruments.push(new Instrument());
-    this.tracks = Array.from({ length: TRACKS }, (_, i) => Object.assign({ name: 'TRK' + (i + 1), auto: '' }, defaultsOf(TRACK_PARAMS), TRACK_FX_DEFAULTS));
+    // kind: 'synth' (normal track, INS = instrument) or 'sample' (INS = slot in this track's kit of sampler instruments)
+    this.tracks = Array.from({ length: TRACKS }, (_, i) => Object.assign({ name: 'TRK' + (i + 1), auto: '', kind: 'synth', kit: [] }, defaultsOf(TRACK_PARAMS), TRACK_FX_DEFAULTS));
     this.master = defaultsOf(MASTER_PARAMS);
     this.fx = Object.assign(defaultsOf(REV_PARAMS), defaultsOf(DLY_PARAMS));
     this.samples = new Map(); this.nextSampleId = 1;
@@ -1572,6 +1642,9 @@ function makeDefaultSong() {
   s.tracks[3].auto = 'i:4:cutoff';
   for (let r = 0; r < 64; r += 2) p.data[p.i(r, 3) + 6] = Math.round(40 + 120 * (0.5 - 0.5 * Math.cos(r / 64 * 2 * Math.PI)));
   Object.assign(s.tracks[6], { fxType: 6, fxA: 0.25, fxB: 0.7, fxC: 0.4, fxMix: 0.6 });
+  // SAMPLE track demo: track 1 plays a kit (01 KICK, 02 SNARE, 03 HAT); slot-only rows play at natural pitch
+  Object.assign(s.tracks[0], { kind: 'sample', kit: [1, 2, 3] });
+  put(14, 0, -1, 3, 0x20); put(30, 0, -1, 3, 0x20); put(46, 0, -1, 2, 0x14); put(62, 0, -1, 3, 0x20);
   // note lengths: the FM bell notes last 3 rows
   bell.forEach((n, i) => { p.data[p.i(i * 8 + 4, 7) + 5] = 3; });
   fx(0, 2, 8, 0xB0);
@@ -1846,7 +1919,7 @@ class Player {
     if (c.vibWave < 4) c.vibPos = 0;
     if (c.tremWave < 4) c.tremPos = 0;
     const pitch = n + c.fine, vol = c.vol / 64;
-    evs.push({ t: time, k: 'on', ch: t, inst: c.inst, note: n, pitch, vol, pan: c.pan, offset: off });
+    evs.push({ t: time, k: 'on', ch: t, inst: c.inst, note: n, pitch, vol, pan: c.pan, offset: off, mono: this.song.tracks[t].kind === 'sample' });
     c.sPitch = pitch; c.sVol = vol; c.sPan = c.pan;
   }
   doRow(time, evs) {
@@ -1854,14 +1927,19 @@ class Player {
     this.rowDelay = 0;
     for (let t = 0; t < TRACKS; t++) {
       const c = this.ch[t], o = p.i(this.row, t);
-      const n = d[o], ins = d[o + 1], v = d[o + 2], fx = d[o + 3], pa = fx >= 0 ? Math.max(0, d[o + 4]) : 0;
+      const tr = this.song.tracks[t], smpTrack = tr.kind === 'sample';
+      const ins0 = d[o + 1], v = d[o + 2], fx = d[o + 3], pa = fx >= 0 ? Math.max(0, d[o + 4]) : 0;
+      // SAMPLE track: the INS column holds a kit slot. A slot without a note plays the sample at its natural pitch.
+      const ins = smpTrack && ins0 > 0 ? (tr.kit[ins0 - 1] > 0 ? tr.kit[ins0 - 1] : -2) : ins0;
+      let n = d[o];
+      if (smpTrack && ins > 0 && n < 0) { const I = this.song.instruments[ins]; n = I && I.p.root != null ? I.p.root : 48; }
       const x = pa >> 4, y = pa & 15, len = d[o + 5], au = d[o + 6];
       if (c.gate > 0 && --c.gate === 0) evs.push({ t: time, k: 'off', ch: t });   // LEN column: note-off after N rows
       if (n >= 0 && n < 120) c.gate = len > 0 ? len : 0;
       if (au >= 0 && this.song.tracks[t].auto) evs.push({ t: time, k: 'auto', tgt: this.song.tracks[t].auto, v: au });
       c.fx = fx; c.pa = pa; c.arpOff = 0; c.delayed = null;
       let off = 0;
-      if (ins > 0) { c.inst = ins; c.vol = 64; }
+      if (ins > 0) { c.inst = ins; c.vol = 64; } else if (ins === -2) c.inst = 0;   // -2: empty kit slot = silence
       if (v >= 0) c.vol = Math.min(v, 64);
       switch (fx) {
         case 0x1: if (pa) c.upMem = pa; break;
@@ -2026,7 +2104,7 @@ async function requestWakeLock(on) {
 let song = makeDefaultSong();
 const state = {
   tab: 'pattern', order: 0, row: 0, track: 0, field: 0, octave: 4, step: 1, inst: 1,
-  edit: true, follow: true, view: 'full', noteLen: 0, loop: true, sel: null, selMode: false,
+  edit: true, follow: true, view: 'full', noteLen: 0, loop: true, kitSlot: new Array(TRACKS).fill(1), sel: null, selMode: false,
   padShown: { pattern: true, instr: false, mixer: false, file: false }, sidePage: 'edit', clip: null, playPos: null,
   mute: new Array(TRACKS).fill(false), solo: new Array(TRACKS).fill(false),
   instPage: 0, waveMode: 'nav', snap: true, gainDb: 3, sliceN: 8, sliceSens: 50, sliceMin: 60,
@@ -2112,7 +2190,9 @@ const FIELD_CHARS = [0, 4, 5, 7, 8, 10, 11, 12, 14, 15, 17, 18], FIELD_LEN = [3,
 const FIELD_COL = [0, 1, 1, 2, 2, 3, 4, 4, 5, 5, 6, 6];   // field -> cell data column
 const VIEWS = { compact: { fields: 3, chars: 7 }, normal: { fields: 8, chars: 14 }, full: { fields: 12, chars: 20 } };
 const numFields = () => VIEWS[state.view].fields;
-const isDialField = f => f >= 8;   // LEN / AUTO columns use the dial pad
+// which dial the pad shows for the cursor: LEN / AUTO columns, or the sample-slot column on SAMPLE tracks
+const dialKind = (f = state.field) => f >= 10 ? 'auto' : f >= 8 ? 'len' : (f === 1 || f === 2) && song.tracks[state.track].kind === 'sample' ? 'smp' : null;
+const isDialField = f => dialKind(f) !== null;
 function editPat(fn) { const pi = curPatIndex(); undo.snap(pi); fn(song.patterns[pi]); patView.dirty = true; markDirty(); }
 function liveRow() {
   return (sched.playing && state.follow && state.playPos && state.playPos.order === state.order) ? state.playPos.row : state.row;
@@ -2141,7 +2221,7 @@ function enterNote(n) {
   editPat(p => {
     const o = p.i(row, state.track);
     p.data[o] = n;
-    if (n < 120) { p.data[o + 1] = state.inst; if (state.noteLen) p.data[o + 5] = state.noteLen; }
+    if (n < 120) { p.data[o + 1] = isSmpTrack(state.track) ? kitSlot(state.track) : state.inst; if (state.noteLen) p.data[o + 5] = state.noteLen; }
   });
   advance();
 }
@@ -2513,7 +2593,7 @@ class ParamBox {
 // =====================================================================
 const C = {
   bg: '#050807', panel: '#0d1311', row4: '#0b1310', row16: '#102019', curRow: '#15302a', playRow: '#1b4d2d', sel: 'rgba(82,212,255,.22)',
-  note: '#e6f5ec', inst: '#52d4ff', vol: '#39ff88', fx: '#ffb13b', par: '#ffd88a', empty: '#26342e', off: '#ff4d61', len: '#b99bff', auto: '#ff7ad9',
+  note: '#e6f5ec', inst: '#52d4ff', vol: '#39ff88', fx: '#ffb13b', par: '#ffd88a', empty: '#26342e', off: '#ff4d61', len: '#b99bff', auto: '#ff7ad9', smp: '#ffd24a',
   num: '#4a5d55', numHi: '#b9d4c6', line: '#1c2723', acc: '#39ff88', mute: '#3a1016', wave: '#39ff88',
 };
 class PatternView {
@@ -2665,13 +2745,17 @@ class PatternView {
       g.fillStyle = state.mute[t] ? C.mute : t === state.track ? '#15241f' : '#0f1714'; g.fillRect(x, 0, tw - 1, top);
       g.fillStyle = t === state.track ? C.acc : C.numHi; g.font = 'bold 12px ' + getComputedStyle(document.body).fontFamily;
       g.fillText(String(t + 1), x + 6, 12);
-      const ar = song.tracks[t].auto && autoResolve(song.tracks[t].auto);
+      const ar = song.tracks[t].auto && autoResolve(song.tracks[t].auto), smpT = song.tracks[t].kind === 'sample';
+      g.font = 'bold 10px ' + getComputedStyle(document.body).fontFamily;
+      if (smpT) { g.fillStyle = C.smp; g.fillText('SMP', x + 22, 12); }
       if (ar && tw > 110) {
-        g.fillStyle = C.auto; g.font = 'bold 10px ' + getComputedStyle(document.body).fontFamily;
-        let s = 'A:' + ar.pd.label; const room = tw - 84;
+        const ax = x + (smpT ? 48 : 22), room = tw - 62 - (ax - x);
+        g.fillStyle = C.auto;
+        let s = 'A:' + ar.pd.label;
         while (s.length > 3 && g.measureText(s).width > room) s = s.slice(0, -1);
-        g.fillText(s, x + 22, 12); g.font = 'bold 12px ' + getComputedStyle(document.body).fontFamily;
+        if (room > 16) g.fillText(s, ax, 12);
       }
+      g.font = 'bold 12px ' + getComputedStyle(document.body).fontFamily;
       const bx = x + tw - 54;
       g.fillStyle = state.mute[t] ? C.off : '#1d2925'; g.fillRect(bx, 3, 24, 19);
       g.fillStyle = state.solo[t] ? C.acc : '#1d2925'; g.fillRect(bx + 26, 3, 24, 19);
@@ -2693,7 +2777,7 @@ class PatternView {
   drawCell(p, r, t, x, y) {
     const g = this.g, cw = this.cw, o = p.i(r, t), d = p.data, n = d[o], i = d[o + 1], v = d[o + 2], f = d[o + 3], pa = d[o + 4];
     g.fillStyle = n < 0 ? C.empty : n >= 120 ? C.off : C.note; g.fillText(n < 0 ? '...' : noteName(n), x, y);
-    g.fillStyle = i < 0 ? C.empty : C.inst; g.fillText(i < 0 ? '..' : hex(i), x + cw * 4, y);
+    g.fillStyle = i < 0 ? C.empty : song.tracks[t].kind === 'sample' ? C.smp : C.inst; g.fillText(i < 0 ? '..' : hex(i), x + cw * 4, y);
     if (state.view === 'compact') return;
     g.fillStyle = v < 0 ? C.empty : C.vol; g.fillText(v < 0 ? '..' : hex(v), x + cw * 7, y);
     if (f < 0) { g.fillStyle = C.empty; g.fillText('...', x + cw * 10, y); }
@@ -3062,16 +3146,17 @@ function applyPreset(name) {
   ins.preset = name; if (auto) ins.name = name;
   engine.markInst(state.inst); renderParams(); refreshAll();
 }
-async function loadSampleFile(file) {
-  if (!engine.ready) return;
+async function loadSampleFile(file, idx = state.inst) {
+  if (!engine.ready) return false;
   toast('Decoding ' + file.name + '...');
   try {
     const ab = await engine.ctx.decodeAudioData(await file.arrayBuffer());
     const ch = [];
     for (let c = 0; c < Math.min(2, ab.numberOfChannels); c++) ch.push(new Float32Array(ab.getChannelData(c)));
-    assignSample(state.inst, song.addSample(ab.sampleRate, ch, file.name.replace(/\.[^.]+$/, '')));
+    assignSample(idx, song.addSample(ab.sampleRate, ch, file.name.replace(/\.[^.]+$/, '')));
     toast('Loaded ' + file.name + ' (' + (ab.duration).toFixed(2) + 's)');
-  } catch (e) { toast('Could not decode file: ' + (e.message || e), 4000); }
+    return true;
+  } catch (e) { toast('Could not decode file: ' + (e.message || e), 4000); return false; }
 }
 const recorder = {
   on: false, busy: false,
@@ -3319,8 +3404,12 @@ function exportMOD() {
     if (p.rows > 64) warn.add('rows beyond 64 are cut');
     if (song.speed !== 6 || song.bpm !== 125) warn.add('add F' + hex(song.speed) + '/F' + hex(song.bpm) + ' to the first row to keep the tempo');
     for (let r = 0; r < rows; r++) for (let t = 0; t < nch; t++) {
-      const o = p.i(r, t), d = p.data, q = off + (r * nch + t) * 4, n = d[o], v = d[o + 2];
-      let ins = d[o + 1], fx = d[o + 3], pa = Math.max(0, d[o + 4]), per = 0;
+      const o = p.i(r, t), d = p.data, q = off + (r * nch + t) * 4, v = d[o + 2];
+      let n = d[o], ins = d[o + 1], fx = d[o + 3], pa = Math.max(0, d[o + 4]), per = 0;
+      if (song.tracks[t].kind === 'sample' && ins > 0) {   // kit slot -> instrument; slot-only rows get the natural note
+        ins = song.tracks[t].kit[ins - 1] | 0;
+        if (ins && n < 0) n = song.instruments[ins].p.root != null ? song.instruments[ins].p.root : 48;
+      }
       if (n >= 0 && n < 120) {
         let idx = n - 36;
         while (idx < 0) idx += 12;
@@ -3459,7 +3548,9 @@ function renderSide() {
       btn('-12', () => transpose(-12)), btn('+12', () => transpose(12)), btn('PANIC', () => { stop(); engine.panic(); }, 'red'),
       btn('INS ROW', () => insRow(false)), btn('DEL ROW', () => insRow(true)), ui.followBtn,
       ui.compactBtn,
+      ui.kindBtn = btn('SYNTH', () => toggleTrackKind(state.track)),
     );
+    ui.kindBtn.classList.add('span2');
     refreshSideToggles();
   } else {
     c.append(btn('PAT-', () => orderOps.pat(-1)), btn('PAT+', () => orderOps.pat(1)), btn('NEW', () => orderOps.add(), 'amber'),
@@ -3475,6 +3566,8 @@ function renderSide() {
 function refreshSideToggles() {
   if (!ui.selBtn) return;
   ui.selBtn.classList.toggle('on', state.selMode); ui.followBtn.classList.toggle('on', state.follow); ui.compactBtn.textContent = state.view.toUpperCase();
+  const smp = isSmpTrack(state.track);   // track type of the cursor track: tap to switch
+  ui.kindBtn.textContent = 'TRK ' + (state.track + 1) + ': ' + (smp ? 'SAMPLE' : 'SYNTH'); ui.kindBtn.classList.toggle('smp', smp);
 }
 function renderOrderList() {
   if (state.sidePage !== 'order' || !ui.olist) return;
@@ -3502,7 +3595,8 @@ function previewDown(id, note) {
   if (!engine.ready || note < 0 || note > 119) return;
   const ch = PREVIEW_CH0 + (previewNext++ % PREVIEW_CHS);
   previewMap.set(id, ch);
-  engine.noteOn(ch, state.inst, note, state.tab === 'pattern' ? state.track : 0);
+  const smp = state.tab === 'pattern' && isSmpTrack(state.track) && kitInst(state.track, kitSlot(state.track));
+  engine.noteOn(ch, smp || state.inst, note, state.tab === 'pattern' ? state.track : 0);
 }
 function previewUp(id) { const ch = previewMap.get(id); if (ch != null) { engine.noteOff(ch); previewMap.delete(id); } }
 function buildPad() {
@@ -3557,22 +3651,25 @@ function buildPad() {
 // ---- dial pad: LEN (note length in rows) and AUTO (automation value 00-FF) columns ----
 const dial = { held: false, lastRow: -1, val: -1 };
 function dialInfo() {
-  const auto = state.field >= 10, col = auto ? 6 : 5, p = curPat(), row = liveRow();
-  return { auto, col, row, raw: p.data[p.i(row, state.track) + col], r: auto ? autoResolve(song.tracks[state.track].auto) : null,
-    min: auto ? 0 : 1, max: auto ? 255 : Math.min(255, p.rows) };
+  const kind = dialKind(), auto = kind === 'auto', smp = kind === 'smp', col = { len: 5, auto: 6, smp: 1 }[kind] || 5, p = curPat(), row = liveRow();
+  return { kind, auto, smp, col, row, raw: p.data[p.i(row, state.track) + col], r: auto ? autoResolve(song.tracks[state.track].auto) : null,
+    min: auto ? 0 : 1, max: auto ? 255 : smp ? Math.max(1, song.tracks[state.track].kit.length) : Math.min(255, p.rows) };
 }
 function dialWrite(raw, audition) {
   const di = dialInfo(), p = curPat();
   if (di.auto && !di.r) { toast('Choose an automation target for this track first'); return; }
+  if (di.smp && !song.tracks[state.track].kit.length) { toast('This kit is empty: add a sample with + ADD'); return; }
   if (state.edit) { p.data[p.i(di.row, state.track) + di.col] = raw; patView.dirty = true; markDirty(); }
   if (di.auto && audition) applyAutoNow(di.r, raw);
+  if (di.smp) { state.kitSlot[state.track] = raw; if (audition && raw !== dial.heard) { dial.heard = raw; previewKit(state.track, raw); } }
   refreshDial();
 }
 function nudge(d) {
   const di = dialInfo();
   if (di.auto && !di.r) return toast('Choose an automation target for this track first');
   let raw = di.raw;
-  if (raw < 0) raw = di.auto ? autoRaw(di.r) : 4;
+  if (raw < 0) raw = di.auto ? autoRaw(di.r) : di.smp ? kitSlot(state.track) - d : 4;
+  dial.heard = null;
   if (state.edit) undo.snap(curPatIndex());
   dialWrite(clamp(raw + d, di.min, di.max), true);
 }
@@ -3595,12 +3692,39 @@ function buildDial() {
     const r = ui.dSl.getBoundingClientRect(), di = dialInfo(), n = clamp((e.clientX - r.left - 12) / Math.max(1, r.width - 24), 0, 1);
     dial.val = Math.round(di.min + n * (di.max - di.min)); dial.lastRow = di.row; dialWrite(dial.val, true);
   };
-  ui.dSl.addEventListener('pointerdown', e => { e.preventDefault(); id = e.pointerId; ui.dSl.setPointerCapture(id); if (state.edit) undo.snap(curPatIndex()); dial.held = true; at(e); });
+  ui.dSl.addEventListener('pointerdown', e => { e.preventDefault(); id = e.pointerId; ui.dSl.setPointerCapture(id); if (state.edit) undo.snap(curPatIndex()); dial.held = true; dial.heard = null; at(e); });
   ui.dSl.addEventListener('pointermove', e => { if (e.pointerId === id) at(e); });
   const up = e => { if (e.pointerId === id) { id = null; dial.held = false; } };
   ui.dSl.addEventListener('pointerup', up); ui.dSl.addEventListener('pointercancel', up);
-  w.append(nav, el('div', { class: 'dmain' }, el('div', { class: 'dhead' }, ui.dTitle, ui.dTarget, ui.dVal), ui.dSl));
+  // SAMPLE tracks: kit management next to the dial
+  ui.dKitAdd = el('select', { id: 'kit-add', class: 'tsel' });
+  ui.dKitAdd.addEventListener('change', () => {
+    const v = ui.dKitAdd.value, t = state.track; ui.dKitAdd.value = '';
+    if (v === 'load') { const idx = freeInst(); if (!idx) return toast('No free instrument slot'); ui.pendingKit = { t, idx }; $('#file').click(); return; }
+    const id = +v; if (!id) return;
+    const slot = kitAdd(t, id); state.kitSlot[t] = slot; dial.heard = null; previewKit(t, slot); refreshDial();
+    toast('Slot ' + hex(slot) + ' = ' + (song.instruments[id].name || hex(id)));
+  });
+  ui.dKitDel = btn('✕ SLOT', () => {
+    const t = state.track, di = dialInfo(), slot = di.raw > 0 ? di.raw : kitSlot(t);
+    if (!kitInst(t, slot)) return toast('Slot ' + hex(slot) + ' is already empty');
+    kitRemove(t, slot); toast('Removed slot ' + hex(slot) + ' from the kit'); refreshDial(); patView.dirty = true;
+  }, 'red');
+  w.append(nav, el('div', { class: 'dmain' }, el('div', { class: 'dhead' }, ui.dTitle, ui.dTarget, ui.dKitAdd, ui.dKitDel, ui.dVal), ui.dSl));
   return w;
+}
+function fillKitAdd() {
+  const sel = ui.dKitAdd, kit = song.tracks[state.track].kit;
+  const key = kit.join(',') + '|' + song.instruments.map(i => i ? i.sampleId + i.name : '').join(',');
+  if (sel.dataset.key === key) return;
+  sel.dataset.key = key; sel.innerHTML = '';
+  sel.append(el('option', { value: '', text: '+ ADD SAMPLE' }), el('option', { value: 'load', text: 'LOAD A FILE…' }));
+  const g = el('optgroup', { label: 'SAMPLES IN THIS SONG' });
+  for (let i = 1; i <= MAX_INST; i++) {
+    const x = song.instruments[i];
+    if (x.type === 'sampler' && x.sampleId) g.append(el('option', { value: i, text: hex(i) + ' ' + (x.name || 'SAMPLE') + (kit.includes(i) ? '  (in kit)' : '') }));
+  }
+  sel.append(g); sel.value = '';
 }
 function fillTargets() {
   const cur = song.tracks[state.track].auto, sel = ui.dTarget;
@@ -3625,14 +3749,20 @@ function fillTargets() {
 function refreshDial() {
   if (!ui.dTitle || state.tab !== 'pattern' || !isDialField(state.field)) return;
   const di = dialInfo();
-  ui.dTitle.textContent = di.auto ? 'AUTO' : 'LEN';
-  ui.dTarget.hidden = !di.auto;
+  ui.dTitle.textContent = di.auto ? 'AUTO' : di.smp ? 'SAMPLE' : 'LEN';
+  ui.dialWrap.classList.toggle('smpmode', di.smp);
+  ui.dTarget.hidden = !di.auto; ui.dKitAdd.hidden = !di.smp; ui.dKitDel.hidden = !di.smp;
   if (di.auto) fillTargets();
+  if (di.smp) fillKitAdd();
   let txt;
-  if (di.auto) txt = !di.r ? 'pick a target →' : di.raw < 0 ? '.. (now ' + fmtParam(di.r.pd, di.r.obj[di.r.key], di.r.ins) + ')' : hex(di.raw) + ' = ' + fmtParam(di.r.pd, autoValue(di.r, di.raw), di.r.ins);
+  if (di.smp) {
+    const kit = song.tracks[state.track].kit, nm = s => { const id = kit[s - 1] | 0; return id ? (song.instruments[id].name || 'INST ' + hex(id)) : '(empty slot)'; };
+    txt = !kit.length ? 'kit is empty: + ADD a sample' : di.raw < 0 ? '.. (next: ' + hex(kitSlot(state.track)) + ' ' + nm(kitSlot(state.track)) + ')' : hex(di.raw) + ' = ' + nm(di.raw) + '   [' + kit.length + ' in kit]';
+  }
+  else if (di.auto) txt = !di.r ? 'pick a target →' : di.raw < 0 ? '.. (now ' + fmtParam(di.r.pd, di.r.obj[di.r.key], di.r.ins) + ')' : hex(di.raw) + ' = ' + fmtParam(di.r.pd, autoValue(di.r, di.raw), di.r.ins);
   else txt = di.raw < 0 ? '.. (holds until next note / OFF)' : hex(di.raw) + ' = ' + di.raw + (di.raw === 1 ? ' row' : ' rows');
   ui.dVal.textContent = 'ROW ' + hex(di.row) + '   ' + txt;
-  const shown = di.raw >= 0 ? di.raw : di.auto && di.r ? autoRaw(di.r) : di.min;
+  const shown = di.raw >= 0 ? di.raw : di.auto && di.r ? autoRaw(di.r) : di.smp ? kitSlot(state.track) : di.min;
   setSliderPos(ui.dFill, ui.dThumb, (shown - di.min) / Math.max(1, di.max - di.min));
   ui.dSl.classList.toggle('empty', di.raw < 0);
 }
@@ -3644,7 +3774,7 @@ function refreshPad() {
   ui.pianoWrap.style.display = hexMode || dialMode ? 'none' : 'flex';
   ui.hexWrap.style.display = hexMode ? 'grid' : 'none';
   ui.dialWrap.style.display = dialMode ? 'flex' : 'none';
-  refreshDial();
+  refreshDial(); refreshSideToggles();
   ui.pianoKeys.forEach(k => { const sp = k.querySelector('span'); if (sp) sp.textContent = 'C' + (state.octave + (+k.dataset.s) / 12); });
   NumBox.all.forEach(n => n.refresh());
 }
@@ -3670,7 +3800,16 @@ function buildInstr() {
     ui.iname.replaceWith(inp); inp.focus(); inp.select();
   }, 'iname');
   const fileIn = $('#file');
-  fileIn.addEventListener('change', () => { if (fileIn.files[0]) loadSampleFile(fileIn.files[0]); fileIn.value = ''; });
+  fileIn.addEventListener('change', async () => {
+    const f = fileIn.files[0], pk = ui.pendingKit; fileIn.value = ''; ui.pendingKit = null;
+    if (!f) return;
+    if (!pk) return loadSampleFile(f);
+    // loading from the SAMPLE dial: new instrument + next kit slot
+    if (await loadSampleFile(f, pk.idx)) {
+      const slot = kitAdd(pk.t, pk.idx); state.kitSlot[pk.t] = slot; dial.heard = null;
+      toast('Slot ' + hex(slot) + ' = ' + song.instruments[pk.idx].name); refreshDial(); previewKit(pk.t, slot);
+    }
+  });
   const prev = btn('▶ ROOT', () => { }, 'amber');
   prev.addEventListener('pointerdown', e => { e.preventDefault(); prev.setPointerCapture(e.pointerId); previewDown('root', curInst().p.root != null ? curInst().p.root : 48); });
   prev.addEventListener('pointerup', () => previewUp('root')); prev.addEventListener('pointercancel', () => previewUp('root'));
@@ -3679,7 +3818,7 @@ function buildInstr() {
   ui.itype.addEventListener('change', () => setInstType(ui.itype.value));
   const recBtn = btn('REC', () => recorder.toggle(recBtn), 'rec');
   ib.append(btn('◂', () => selectInst(state.inst - 1)), ui.iname, btn('▸', () => selectInst(state.inst + 1)),
-    el('div', { class: 'sep' }), btn('LOAD', () => fileIn.click(), 'cyan'), recBtn, prev,
+    el('div', { class: 'sep' }), btn('LOAD', () => { ui.pendingKit = null; fileIn.click(); }, 'cyan'), recBtn, prev,
     el('div', { class: 'sep' }), ui.itype,
     ui.clrInst = btn('CLR INST', () => {
       const b = ui.clrInst;   // two-tap confirm (no confirm() dialog)
@@ -4014,6 +4153,13 @@ $('#helptext').innerHTML = `<b>MOBTRACK — quick reference</b>   (tap anywhere 
  SEL mode: drag to select a block → COPY/CUT/PASTE/CLEAR/transpose/INTERP (interpolates the cursor's column)
  ALL cycles: track → pattern → none.   EDIT (red) off = jam without writing.
  While playing with FOLLOW + EDIT, notes are recorded live at the playing row.
+
+<b>TRACK TYPES</b>  EDIT page button "TRK n: SYNTH / SAMPLE" switches the cursor track (existing notes are converted, undoable).
+ SYNTH track: works as before (INS column = instrument number).
+ SAMPLE track (header shows SMP, gold INS column): the track has its own KIT of samples; the INS column is a kit
+   SLOT. Put the cursor on it and the pad becomes the SAMPLE dial: slide to pick a slot (you hear it), it is written
+   on the row. + ADD SAMPLE adds a sample from the song or LOAD A FILE; ✕ SLOT empties a slot.
+   A slot without a note plays the sample at its natural pitch; add a note to pitch it. Always monophonic.
 
 <b>EFFECTS</b> (param memory as in ProTracker; pitch slides are linear, xx/16 semitone per tick)
  0xy arpeggio        1xx porta up         2xx porta down      3xx tone porta      4xy vibrato
