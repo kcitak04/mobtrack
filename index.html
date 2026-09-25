@@ -2147,6 +2147,7 @@ class Scheduler {
 }
 let wakeLock = null;
 async function requestWakeLock(on) {
+  if (window.AndroidBridge) return window.AndroidBridge.keepScreenOn(!!on);
   try {
     if (on && !wakeLock && navigator.wakeLock) { wakeLock = await navigator.wakeLock.request('screen'); wakeLock.addEventListener('release', () => wakeLock = null); }
     else if (!on && wakeLock) { await wakeLock.release(); wakeLock = null; }
@@ -3264,7 +3265,21 @@ const recorder = {
 // 11a. FILES: projects, WAV export (offline render), MOD import/export, autosave
 // =====================================================================
 const fname = ext => ((song.title || 'song').replace(/[^\w\- ]+/g, '').trim() || 'song') + ext;
+// Android app: WebViews can't download blob: links, so files go to the native side in base64 chunks
+const NATIVE = window.AndroidBridge || null;
+async function nativeSave(blob, name, share) {
+  const bytes = new Uint8Array(await blob.arrayBuffer()), CH = 393216;
+  NATIVE.saveBegin(name, blob.type || 'application/octet-stream');
+  for (let i = 0; i < bytes.length; i += CH) {
+    const part = bytes.subarray(i, i + CH);
+    let s = '';
+    for (let j = 0; j < part.length; j += 0x8000) s += String.fromCharCode.apply(null, part.subarray(j, j + 0x8000));
+    NATIVE.saveChunk(btoa(s));
+  }
+  return NATIVE.saveEnd(!!share);
+}
 function saveBlob(blob, name) {
+  if (NATIVE) return nativeSave(blob, name, false);
   const a = el('a', { href: URL.createObjectURL(blob), download: name });
   document.body.append(a); a.click();
   setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 5000);
@@ -3333,19 +3348,20 @@ async function exportWav() {
     const { buf, songEnd, start } = await renderSong(p => ui.wavStatus.textContent = 'Rendering ' + Math.round(p * 100) + '%');
     lastWav = new File([encodeWAV(buf, Math.round(songEnd * buf.sampleRate), start)], fname('.wav'), { type: 'audio/wav' });
     saveBlob(lastWav, lastWav.name);
-    ui.wavStatus.textContent = lastWav.name + '  ' + (lastWav.size / 1048576).toFixed(1) + ' MB  (saved to Downloads)';
-    ui.shareBtn.hidden = !(navigator.canShare && navigator.canShare({ files: [lastWav] }));
+    ui.wavStatus.textContent = lastWav.name + '  ' + (lastWav.size / 1048576).toFixed(1) + ' MB  (saved to Downloads' + (NATIVE ? '/MOBTRACK' : '') + ')';
+    ui.shareBtn.hidden = !(NATIVE || (navigator.canShare && navigator.canShare({ files: [lastWav] })));
   } catch (e) {
     ui.wavStatus.textContent = 'Render failed: ' + (e.message || e);
   } finally { ui.rendering = false; }
 }
 async function shareWav() {
+  if (NATIVE) return nativeSave(lastWav, lastWav.name, true);
   try { await navigator.share({ files: [lastWav], title: lastWav.name }); }
   catch (e) { if (e.name !== 'AbortError') toast('Share failed: ' + e.message); }
 }
 function saveProject() {
   saveBlob(new Blob([JSON.stringify(songToObj(false))], { type: 'application/json' }), fname('.mtk'));
-  toast('Saved ' + fname('.mtk') + ' to Downloads');
+  if (!NATIVE) toast('Saved ' + fname('.mtk') + ' to Downloads');   // the Android app shows its own message
 }
 
 // ---- ProTracker MOD ----
@@ -4116,7 +4132,7 @@ function buildFile() {
 }
 // ---- installable app (PWA): Chrome on Android installs it as a real app (icon, full screen, offline) ----
 let installEvt = null;
-const isInstalledApp = () => matchMedia('(display-mode: fullscreen), (display-mode: standalone)').matches;
+const isInstalledApp = () => !!window.AndroidBridge || matchMedia('(display-mode: fullscreen), (display-mode: standalone)').matches;
 window.addEventListener('beforeinstallprompt', e => { e.preventDefault(); installEvt = e; refreshFile(); });
 window.addEventListener('appinstalled', () => { installEvt = null; toast('MOBTRACK is installed: open it from your app drawer'); refreshFile(); });
 async function installApp() {
@@ -4128,7 +4144,8 @@ async function installApp() {
 function refreshFile() {
   if (!ui.title) return;
   ui.installBtn.hidden = !installEvt;
-  ui.appStatus.textContent = isInstalledApp() ? 'Running as an installed app (works offline).'
+  ui.appStatus.textContent = window.AndroidBridge ? 'Running as the MOBTRACK Android app. Files are saved to Downloads/MOBTRACK.'
+    : isInstalledApp() ? 'Running as an installed app (works offline).'
     : installEvt ? 'Install MOBTRACK as an app: own icon, full screen, works offline.'
     : location.protocol === 'https:' ? 'To install: Chrome menu ⋮ → "Install app" or "Add to Home screen".'
     : 'Open the web version (https) in Chrome to install it as an app.';
@@ -4137,6 +4154,7 @@ function refreshFile() {
     : 'Your work is autosaved in this browser every 30 s and when you leave the page.';
 }
 function toggleFullscreen() {
+  if (window.AndroidBridge) return toast('The app already runs full screen');
   const d = document;
   if (!d.fullscreenElement) {
     (d.documentElement.requestFullscreen ? d.documentElement.requestFullscreen({ navigationUI: 'hide' }) : Promise.reject())
@@ -4302,7 +4320,8 @@ function boot() {
   waveView = new WaveView($('#wave'));
   buildTop(); buildSide(); buildPad(); buildInstr(); buildFile(); initMixScroll(); renderMixer();
   bindHScroll($('#top'), $('#topnav'));
-  if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('sw.js').catch(() => { });
+  // web version only: the Android app already ships all files inside the APK
+  if (!window.AndroidBridge && 'serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('sw.js').catch(() => { });
   refreshAll(); refreshUndoBtns();
   requestAnimationFrame(frame);
   let saved = null;
