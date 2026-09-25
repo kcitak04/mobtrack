@@ -141,11 +141,23 @@ main{flex:1;min-height:0;position:relative}
 .dsl .trk i{background:var(--mag)}
 .dsl b{position:absolute;top:calc(50% - 13px);width:26px;height:26px;margin-left:-13px;border-radius:50%;background:var(--mag);box-shadow:0 0 0 3px #08100d}
 .dsl.empty b{background:#3a2a36}
-/* mixer: 3 columns per strip, whole panel scrolls both ways; boxes scroll, sliders edit */
-.strips{overflow:auto!important;touch-action:pan-x pan-y}
+/* mixer: 3 columns per strip. Swiping never scrolls it (no accidental edits): move with the scroll bars */
+#view-mixer{grid-template-rows:minmax(0,1fr) 36px!important}
+.mixwrap{display:flex;min-height:0;min-width:0}
+.strips{flex:1;overflow:auto!important;touch-action:none!important;scrollbar-width:none}
+.strips::-webkit-scrollbar{display:none}
 .strip{width:252px!important;grid-template-columns:1fr 1fr 1fr!important;grid-auto-rows:52px!important;overflow:visible!important}
 .strip .sh{grid-column:span 3!important}
-.strip .param{touch-action:pan-x pan-y}
+.strip .param{touch-action:none}
+.vbar,.hbar{position:relative;background:#08100d;touch-action:none;flex:none}
+.vbar{width:30px;border-left:1px solid var(--line)}
+.hbar{border-top:1px solid var(--line)}
+.vbar b,.hbar b{position:absolute;border:2px solid var(--acc);border-radius:5px;background:rgba(57,255,136,.14);pointer-events:none}
+.vbar b{left:3px;right:3px}
+.hbar b{top:3px;bottom:3px}
+.hbar .lbls{position:absolute;inset:0 30px 0 0;display:flex}
+.hbar .lbls span{flex:1;text-align:center;line-height:34px;font-size:11px;font-weight:700;color:var(--dim);letter-spacing:1px}
+.btn.dis2{opacity:.4}
 /* portrait: pattern above, tools below */
 @media (orientation:portrait){
   #view-pattern{grid-template-columns:minmax(0,1fr);grid-template-rows:minmax(0,1fr) auto}
@@ -182,7 +194,10 @@ main{flex:1;min-height:0;position:relative}
       <div class="bar" id="wbar"></div>
       <div class="prow"><select id="ipage"></select><div class="params" id="params"></div></div>
     </section>
-    <section id="view-mixer" class="view"><div class="strips" id="strips"></div></section>
+    <section id="view-mixer" class="view">
+      <div class="mixwrap"><div class="strips" id="strips"></div><div class="vbar" id="mix-vbar"><b></b></div></div>
+      <div class="hbar" id="mix-hbar"><div class="lbls"></div><b></b></div>
+    </section>
     <section id="view-file" class="view"><div class="filepane" id="filepane"></div></section>
   </main>
   <div id="pad"></div>
@@ -1433,7 +1448,7 @@ function songToObj(raw) {
     format: 'mobtrack', version: 3, title: s.title, bpm: s.bpm, speed: s.speed, order: s.order.slice(),
     patterns: s.patterns.map(p => ({ rows: p.rows, data: enc(p.data) })),
     instruments: s.instruments.slice(1).map(i => ({ type: i.type, name: i.name, preset: i.preset || '', sampleId: i.sampleId, slices: i.slices.slice(), p: Object.assign({}, i.p) })),
-    samples: [...s.samples.values()].map(x => ({ id: x.id, sr: x.sr, name: x.name, ch: x.ch.map(enc) })),
+    samples: [...s.samples.values()].filter(x => s.instruments.some(i => i && i.sampleId === x.id)).map(x => ({ id: x.id, sr: x.sr, name: x.name, ch: x.ch.map(enc) })),
     tracks: s.tracks.map(t => Object.assign({}, t)), master: Object.assign({}, s.master), fx: Object.assign({}, s.fx),
   };
 }
@@ -2013,22 +2028,69 @@ const curInst = () => song.instruments[state.inst];
 let dirty = 0, savedDirty = 0;          // change counter for autosave
 function markDirty() { dirty++; }
 
-class PatternUndo {
-  constructor() { this.u = []; this.r = []; }
-  snap(pi) { const p = song.patterns[pi]; this.u.push({ pi, rows: p.rows, data: p.data.slice() }); if (this.u.length > 200) this.u.shift(); this.r.length = 0; }
-  swap(from, to) {
-    const s = from.pop(); if (!s) return toast('Nothing to ' + (from === this.u ? 'undo' : 'redo'));
-    const p = song.patterns[s.pi];
-    to.push({ pi: s.pi, rows: p.rows, data: p.data.slice() });
-    p.rows = s.rows; p.data = s.data;
-    const oi = song.order.indexOf(s.pi); if (oi >= 0 && curPatIndex() !== s.pi) state.order = oi;
-    state.row = Math.min(state.row, p.rows - 1);
-    patView.dirty = true; refreshAll();
-  }
-  undo() { this.swap(this.u, this.r); }
-  redo() { this.swap(this.r, this.u); }
+// ---- global undo / redo ----
+// Every entry is a "swap": it holds the other version of some state and exchanges it with the
+// current one, so the same call performs both undo and redo.
+const history = {
+  u: [], r: [],
+  push(e) { this.u.push(e); if (this.u.length > 300) this.u.shift(); this.r.length = 0; refreshUndoBtns(); },
+  step(from, to, verb) {
+    const e = from.pop();
+    if (!e) return toast('Nothing to ' + verb);
+    e.swap(); to.push(e);
+    toast(verb.toUpperCase() + ': ' + e.label, 1400);
+    afterHistory(); refreshUndoBtns();
+  },
+  undo() { this.step(this.u, this.r, 'undo'); },
+  redo() { this.step(this.r, this.u, 'redo'); },
+  clear() { this.u.length = 0; this.r.length = 0; refreshUndoBtns(); },
+};
+function refreshUndoBtns() {
+  if (!ui.undoBtn) return;
+  ui.undoBtn.classList.toggle('dis2', !history.u.length); ui.redoBtn.classList.toggle('dis2', !history.r.length);
 }
-const undo = new PatternUndo();
+function afterHistory() {
+  markDirty();
+  state.row = Math.min(state.row, curPat().rows - 1);
+  patView.dirty = true; waveView.dirty = true;
+  renderParams(); refreshMixer(); refreshFile(); NumBox.all.forEach(n => n.refresh()); refreshAll();
+  if (ui.mixScrollUpdate) ui.mixScrollUpdate();
+}
+function patEntry(p, label = 'pattern edit') {
+  let rows = p.rows, data = p.data.slice();
+  return { label, swap() {
+    const r = p.rows, d = p.data; p.rows = rows; p.data = data; rows = r; data = d;
+    const oi = song.order.indexOf(song.patterns.indexOf(p));
+    if (oi >= 0 && curPat() !== p) state.order = oi;
+  } };
+}
+// tgt = { obj (getter ok), apply(key) } captured when the edit started
+function paramEntry(tgt, key, before, label) {
+  let v = before;
+  return { label, swap() { const cur = tgt.obj[key]; tgt.obj[key] = v; v = cur; tgt.apply(key); } };
+}
+function cloneIns(ins) {
+  const n = new Instrument(ins.type);
+  Object.assign(n, { name: ins.name, preset: ins.preset, sampleId: ins.sampleId, slices: ins.slices.slice(), p: Object.assign({}, ins.p) });
+  return n;
+}
+function instEntry(idx, label) {
+  const arr = song.instruments;
+  let ins = cloneIns(arr[idx]);
+  return { label, swap() { const cur = arr[idx]; arr[idx] = ins; ins = cur; engine.setInst(idx); if (state.inst !== idx) state.inst = idx; engine.watch(idx); waveView.fit(); } };
+}
+function allInstEntry(label) {
+  const arr = song.instruments;
+  let saved = arr.map(i => i && cloneIns(i));
+  return { label, swap() { const cur = arr.slice(); for (let i = 1; i < arr.length; i++) { arr[i] = saved[i]; engine.setInst(i); } saved = cur; waveView.fit(); } };
+}
+function orderEntry(label = 'order list') {
+  const s = song;
+  let ord = s.order.slice();
+  return { label, swap() { const cur = s.order; s.order = ord; ord = cur; state.order = clamp(state.order, 0, s.order.length - 1); } };
+}
+// kept for existing call sites: undo.snap(patternIndex) records a pattern edit
+const undo = { snap(pi) { history.push(patEntry(song.patterns[pi])); }, undo() { history.undo(); }, redo() { history.redo(); } };
 
 // =====================================================================
 // 7. PATTERN EDITING
@@ -2182,25 +2244,40 @@ function newPattern(rows) {
 const orderOps = {
   pat(d) {
     let v = curPatIndex() + d; if (v < 0) return;
+    history.push(orderEntry());
     if (v >= song.patterns.length && newPattern() < 0) return;
     song.order[state.order] = Math.min(v, song.patterns.length - 1); gotoOrder(state.order);
   },
-  ins() { if (song.order.length >= MAX_ORDER) return; song.order.splice(state.order + 1, 0, curPatIndex()); gotoOrder(state.order + 1); },
-  del() { if (song.order.length < 2) return; song.order.splice(state.order, 1); gotoOrder(Math.min(state.order, song.order.length - 1)); },
-  add() { const pi = newPattern(); if (pi < 0 || song.order.length >= MAX_ORDER) return; song.order.splice(state.order + 1, 0, pi); gotoOrder(state.order + 1); },
-  clone() { const src = curPat(), pi = newPattern(); if (pi < 0 || song.order.length >= MAX_ORDER) return; song.patterns[pi] = src.clone(); song.order.splice(state.order + 1, 0, pi); gotoOrder(state.order + 1); },
+  ins() { if (song.order.length >= MAX_ORDER) return; history.push(orderEntry()); song.order.splice(state.order + 1, 0, curPatIndex()); gotoOrder(state.order + 1); },
+  del() { if (song.order.length < 2) return; history.push(orderEntry()); song.order.splice(state.order, 1); gotoOrder(Math.min(state.order, song.order.length - 1)); },
+  add() { const pi = newPattern(); if (pi < 0 || song.order.length >= MAX_ORDER) return; history.push(orderEntry()); song.order.splice(state.order + 1, 0, pi); gotoOrder(state.order + 1); },
+  clone() { const src = curPat(), pi = newPattern(); if (pi < 0 || song.order.length >= MAX_ORDER) return; history.push(orderEntry()); song.patterns[pi] = src.clone(); song.order.splice(state.order + 1, 0, pi); gotoOrder(state.order + 1); },
 };
 
 // =====================================================================
 // 8. UI COMPONENTS
 // =====================================================================
-// slider bar: touch anywhere on the track to jump there, drag to slide (absolute positioning)
-function attachSlider(sl, onNorm) {
-  let id = null;
-  const at = e => { const r = sl.getBoundingClientRect(); onNorm(clamp((e.clientX - r.left - 6) / Math.max(1, r.width - 12), 0, 1)); };
-  sl.addEventListener('pointerdown', e => { e.preventDefault(); e.stopPropagation(); id = e.pointerId; sl.setPointerCapture(id); sl.classList.add('act'); at(e); });
-  sl.addEventListener('pointermove', e => { if (e.pointerId === id) { e.stopPropagation(); at(e); } });
-  const up = e => { if (e.pointerId === id) { id = null; sl.classList.remove('act'); e.stopPropagation(); } };
+// slider bar: drag sideways to change the value relative to where it was (a tap or a vertical
+// swipe never changes anything, so brushing a slider by accident is harmless)
+function attachSlider(sl, onNorm, o = {}) {
+  let id = null, x0 = 0, y0 = 0, n0 = 0, moving = false;
+  sl.addEventListener('pointerdown', e => {
+    e.preventDefault(); e.stopPropagation();
+    id = e.pointerId; sl.setPointerCapture(id); x0 = e.clientX; y0 = e.clientY; moving = false;
+    n0 = o.get ? o.get() : 0;
+    if (o.down) o.down();
+  });
+  sl.addEventListener('pointermove', e => {
+    if (e.pointerId !== id) return;
+    e.stopPropagation();
+    if (!moving) {
+      const dx = e.clientX - x0, dy = e.clientY - y0;
+      if (Math.abs(dx) < 8) { if (Math.abs(dy) > 12) { id = null; if (o.up) o.up(); } return; }
+      moving = true; x0 = e.clientX; sl.classList.add('act');
+    }
+    onNorm(clamp(n0 + (e.clientX - x0) / Math.max(1, sl.getBoundingClientRect().width - 12), 0, 1));
+  });
+  const up = e => { if (e.pointerId === id) { id = null; sl.classList.remove('act'); e.stopPropagation(); if (o.up) o.up(); } };
   sl.addEventListener('pointerup', up); sl.addEventListener('pointercancel', up);
 }
 function setSliderPos(fill, thumb, n) {
@@ -2212,9 +2289,11 @@ class NumBox {
     this.get = get; this.set = set; this.o = Object.assign({ min: 0, max: 127, step: 1, px: 10, fmt: v => String(v) }, o);
     this.el = el('div', { class: 'num' + (o.cls ? ' ' + o.cls : '') }, el('span', { class: 'l', text: label }), this.val = el('span', { class: 'v' }),
       this.sl = el('div', { class: 'sl' }, el('div', { class: 'trk' }, this.fill = el('i')), this.thumb = el('b')));
-    attachSlider(this.sl, n => this.apply(Math.round(this.o.min + n * (this.o.max - this.o.min))));
+    const span = () => this.o.max - this.o.min;
+    attachSlider(this.sl, n => this.apply(Math.round(this.o.min + n * span())),
+      { get: () => (this.get() - this.o.min) / span(), down: () => this.begin(), up: () => this.end() });
     let st = null;
-    this.el.addEventListener('pointerdown', e => { e.preventDefault(); this.el.setPointerCapture(e.pointerId); st = { x: e.clientX, y: e.clientY, v: this.get(), moved: false }; });
+    this.el.addEventListener('pointerdown', e => { e.preventDefault(); this.el.setPointerCapture(e.pointerId); st = { x: e.clientX, y: e.clientY, v: this.get(), moved: false }; this.begin(); });
     this.el.addEventListener('pointermove', e => {
       if (!st) return;
       const dx = e.clientX - st.x, dy = st.y - e.clientY, d = Math.abs(dx) > Math.abs(dy) ? dx : dy;
@@ -2223,10 +2302,19 @@ class NumBox {
     });
     this.el.addEventListener('pointerup', e => {
       if (st && !st.moved) { const r = this.el.getBoundingClientRect(); this.apply(this.get() + (e.clientX < r.left + r.width / 2 ? -1 : 1) * this.o.step); }
-      st = null;
+      st = null; this.end();
     });
-    this.el.addEventListener('pointercancel', () => st = null);
+    this.el.addEventListener('pointercancel', () => { st = null; this.end(); });
     NumBox.all.push(this); this.refresh();
+  }
+  // undo: o.hist = label records a value change; o.begin() lets the owner snapshot something itself
+  begin() { this.before = this.get(); if (this.o.begin) this.o.begin(); }
+  end() {
+    if (this.o.hist && this.before != null && this.get() !== this.before) {
+      let v = this.before;
+      history.push({ label: this.o.hist, swap: () => { const c = this.get(); this.set(v); v = c; this.refresh(); } });
+    }
+    this.before = null;
   }
   apply(v) { v = clamp(v, this.o.min, this.o.max); if (v !== this.get()) this.set(v); this.refresh(); }
   refresh() { const v = this.get(); this.val.textContent = this.o.fmt(v); setSliderPos(this.fill, this.thumb, (v - this.o.min) / (this.o.max - this.o.min)); }
@@ -2247,6 +2335,7 @@ function fromNorm(pd, n, max) {
   return v;
 }
 function fmtParam(pd, v, ins) {
+  if (v == null || Number.isNaN(v)) return '-';
   if (pd.fmtFn) return pd.fmtFn(v);
   if (pd.options) return pd.options[v] || '?';
   const sr = engine.ready ? engine.ctx.sampleRate : 48000;
@@ -2271,22 +2360,31 @@ function onInstParam(key) {
   if (/^(sStart|sEnd|loop|xfade)/.test(key)) waveView.dirty = true;
 }
 // a bind tells a ParamBox where its value lives: instrument params, a mixer track, master or FX
-const instBind = { obj: () => curInst().p, set: (k, v) => { curInst().p[k] = v; onInstParam(k); }, ins: () => curInst() };
-const mixBind = (getObj, update, after) => ({ obj: getObj, set: (k, v) => { getObj()[k] = v; if (engine.ready) update(); markDirty(); if (after) after(k); } });
+// target() captures "which object" when an edit starts, so undo still hits it after you switch instrument/track
+const instBind = {
+  obj: () => curInst().p, set: (k, v) => { curInst().p[k] = v; onInstParam(k); }, ins: () => curInst(),
+  target() { const idx = state.inst; return { get obj() { return song.instruments[idx].p; }, apply(k) { engine.markInst(idx); if (/^(sStart|sEnd|loop|xfade)/.test(k)) waveView.dirty = true; } }; },
+};
+const mixBind = (getObj, update, after) => {
+  const apply = k => { if (engine.ready) update(); markDirty(); if (after) after(k); };
+  return { obj: getObj, set: (k, v) => { getObj()[k] = v; apply(k); }, sliderOnly: true, target: () => ({ obj: getObj(), apply }) };
+};
 class ParamBox {
   constructor(pd, bind = instBind) {
     this.pd = pd; this.b = bind;
     this.el = el('div', { class: 'param' + (pd.options ? ' opt' : '') },
       el('span', { class: 'l', text: pd.label }), this.v = el('span', { class: 'v' }),
       this.sl = el('div', { class: 'sl' }, el('div', { class: 'trk' }, this.fill = el('i')), this.thumb = el('b')));
-    attachSlider(this.sl, n => this.setV(fromNorm(pd, n, this.max())));
+    attachSlider(this.sl, n => this.setV(fromNorm(pd, n, this.max())),
+      { get: () => clamp(toNorm(pd, this.val(), this.max()), 0, 1), down: () => this.begin(), up: () => this.end() });
     let st = null, lastTap = 0;
     this.el.addEventListener('pointerdown', e => {
       e.preventDefault(); this.el.setPointerCapture(e.pointerId);
       st = { x: e.clientX, y: e.clientY, n: toNorm(pd, this.val(), this.max()), moved: false };
+      this.begin();
     });
     this.el.addEventListener('pointermove', e => {
-      if (!st) return;
+      if (!st || this.b.sliderOnly) return;   // mixer: only the slider bar edits values
       const d = st.y - e.clientY;   // vertical drag edits; horizontal swipes scroll the row (touch-action: pan-x)
       if (!st.moved && Math.abs(d) < 6) return;
       st.moved = true;
@@ -2301,10 +2399,15 @@ class ParamBox {
         else if (now - lastTap < 350) this.setV(pd.max === 'len' ? 0 : pd.def);
         lastTap = now;
       }
-      st = null;
+      st = null; this.end();
     });
-    this.el.addEventListener('pointercancel', () => st = null);
+    this.el.addEventListener('pointercancel', () => { st = null; this.end(); });
     this.refresh();
+  }
+  begin() { this.h = { tgt: this.b.target(), before: this.val() }; }
+  end() {
+    const h = this.h; this.h = null;
+    if (h && this.val() !== h.before) history.push(paramEntry(h.tgt, this.pd.key, h.before, this.pd.label.toLowerCase()));
   }
   ins() { return this.b.ins ? this.b.ins() : null; }
   val() { return this.b.obj()[this.pd.key]; }
@@ -2726,12 +2829,15 @@ class WaveView {
 }
 
 // destructive sample edits (with undo)
-const sampleUndo = new Map();
-function pushSampleUndo(s) {
-  const st = sampleUndo.get(s.id) || [];
-  st.push({ ch: s.ch.map(c => c.slice()), insts: song.instruments.map(ins => ins && ins.sampleId === s.id ? { p: Object.assign({}, ins.p), slices: ins.slices.slice() } : null) });
-  if (st.length > 8) st.shift();
-  sampleUndo.set(s.id, st);
+// sample edit entry: swaps the audio data and the marker/slice settings of every instrument using it
+function sampleEntry(s, label) {
+  let ch = s.ch.map(c => c.slice());
+  let insts = song.instruments.map(ins => ins && ins.sampleId === s.id ? { ins, p: Object.assign({}, ins.p), slices: ins.slices.slice() } : null);
+  return { label, swap() {
+    const cur = s.ch; s.ch = ch; ch = cur; s.len = s.ch[0].length;
+    insts = insts.map(x => { if (!x) return null; const o = { ins: x.ins, p: x.ins.p, slices: x.ins.slices }; x.ins.p = x.p; x.ins.slices = x.slices; return o; });
+    commitSample(s); waveView.clampView();
+  } };
 }
 function commitSample(s) {
   buildPeaks(s); engine.setSample(s); markDirty();
@@ -2749,7 +2855,7 @@ const WaveOps = {
   run(fn, useMarkers) {
     const s = waveView.smp; if (!s) return toast('No sample');
     const [a, b] = waveView.range(useMarkers);
-    pushSampleUndo(s); fn(s, a, b); commitSample(s);
+    history.push(sampleEntry(s, fn.label || 'sample edit')); fn(s, a, b); commitSample(s);
   },
   normalize() { this.run((s, a, b) => { let pk = 0; for (const d of s.ch) for (let i = a; i < b; i++) pk = Math.max(pk, Math.abs(d[i])); if (pk > 0) { const g = 0.99 / pk; for (const d of s.ch) for (let i = a; i < b; i++) d[i] *= g; } }); },
   reverse() { this.run((s, a, b) => { for (const d of s.ch) d.subarray(a, b).reverse(); }); },
@@ -2770,14 +2876,7 @@ const WaveOps = {
     }, true);
     waveView.fit();
   },
-  undo() {
-    const s = waveView.smp; if (!s) return;
-    const st = sampleUndo.get(s.id);
-    if (!st || !st.length) return toast('Nothing to undo');
-    const u = st.pop(); s.ch = u.ch; s.len = u.ch[0].length;
-    u.insts.forEach((x, i) => { if (x) { song.instruments[i].p = x.p; song.instruments[i].slices = x.slices; } });
-    commitSample(s); waveView.clampView();
-  },
+  undo() { history.undo(); },
 };
 
 // slicing
@@ -2803,24 +2902,28 @@ function detectTransients(s, a, b, sens, minMs) {
 const SliceOps = {
   equal() {
     const ins = curInst(), s = instSample(ins); if (!s) return toast('No sample');
+    history.push(instEntry(state.inst, 'slices'));
     const a = ins.p.sStart, b = ins.p.sEnd || s.len, n = state.sliceN;
     ins.slices = Array.from({ length: n }, (_, i) => Math.round(a + i * (b - a) / n));
     this.done(ins);
   },
   detect() {
     const ins = curInst(), s = instSample(ins); if (!s) return toast('No sample');
+    history.push(instEntry(state.inst, 'slices'));
     ins.slices = detectTransients(s, ins.p.sStart, ins.p.sEnd || s.len, state.sliceSens / 100, state.sliceMin).slice(0, 128);
     this.done(ins);
   },
-  clear() { const ins = curInst(); ins.slices = []; ins.p.sliceMode = 0; this.done(ins); },
+  clear() { history.push(instEntry(state.inst, 'clear slices')); const ins = curInst(); ins.slices = []; ins.p.sliceMode = 0; this.done(ins); },
   keys() {
     const ins = curInst(); if (!ins.slices.length) return toast('Make slices first');
+    history.push(instEntry(state.inst, 'slice keymap'));
     ins.p.sliceMode = ins.p.sliceMode ? 0 : 1;
     if (ins.p.sliceMode) toast('Slices mapped: ' + noteName(ins.p.root) + ' .. ' + noteName(Math.min(119, ins.p.root + ins.slices.length - 1)));
     this.done(ins);
   },
   toInst() {
     const ins = curInst(); if (!ins.slices.length) return toast('Make slices first');
+    history.push(allInstEntry('slices to instruments'));
     const sl = ins.slices, made = [];
     let j = state.inst + 1;
     for (let i = 0; i < sl.length; i++) {
@@ -2839,9 +2942,10 @@ const SliceOps = {
 
 // sample loading / recording
 function gcSample(id) {   // drop a sample no instrument uses any more
-  if (id && !song.instruments.some(x => x && x.sampleId === id)) { song.samples.delete(id); sampleUndo.delete(id); engine.delSample(id); }
+  // Intentionally keeps unused samples in memory so undo can bring them back; saving skips them (see songToObj).
 }
 function assignSample(i, s) {
+  history.push(instEntry(i, 'new sample'));
   let ins = song.instruments[i];
   const old = ins.sampleId;
   if (ins.type !== 'sampler') ins = song.instruments[i] = new Instrument('sampler');
@@ -2854,6 +2958,7 @@ function assignSample(i, s) {
 function setInstType(type) {
   const ins = curInst();
   if (ins.type === type) return;
+  history.push(instEntry(state.inst, 'instrument type'));
   const n = new Instrument(type), T = INSTRUMENT_TYPES[type];
   if (T.presets) { const [name, pr] = Object.entries(T.presets)[0]; Object.assign(n.p, pr); n.preset = name; n.name = name; }
   song.instruments[state.inst] = n;
@@ -2863,6 +2968,7 @@ function setInstType(type) {
 function applyPreset(name) {
   const ins = curInst(), T = INSTRUMENT_TYPES[ins.type];
   if (!T.presets || !T.presets[name]) return;
+  history.push(instEntry(state.inst, 'preset ' + name));
   const auto = !ins.name || ins.name === ins.preset || ins.name === 'RANDOM';
   ins.p = Object.assign(defaultParams(ins.type), T.presets[name], { pan: ins.p.pan });
   ins.preset = name; if (auto) ins.name = name;
@@ -2929,7 +3035,7 @@ function saveBlob(blob, name) {
 function setSong(s) {
   if (sched.playing) stop();
   song = s; markDirty();
-  undo.u.length = 0; undo.r.length = 0; sampleUndo.clear();
+  history.clear();
   Object.assign(state, { order: 0, row: 0, track: 0, field: 0, sel: null, inst: 1, playPos: null, instPage: 0 });
   state.mute.fill(false); state.solo.fill(false);
   if (engine.ready) { engine.post({ type: 'reset' }); engine.loadSong(); }
@@ -3208,7 +3314,7 @@ function setTab(id) {
   state.tab = id;
   TABS.forEach(t => { $('#view-' + t.id).classList.toggle('on', t.id === id); ui.tabs[t.id].classList.toggle('on', t.id === id); });
   if (id === 'instr') { waveView.dirty = true; renderParams(); refreshInstr(); }
-  if (id === 'mixer') refreshMixer();
+  if (id === 'mixer') { refreshMixer(); requestAnimationFrame(ui.mixScrollUpdate); }
   if (id === 'file') refreshFile();
   refreshPad(); patView.dirty = true;
 }
@@ -3217,6 +3323,8 @@ function buildTop() {
   ui.tabs = {};
   for (const t of TABS) top.append(ui.tabs[t.id] = btn(t.label, () => setTab(t.id), 'tab'));
   top.append(el('div', { class: 'sep' }));
+  top.append(ui.undoBtn = btn('↶ UNDO', () => history.undo(), 'amber', true), ui.redoBtn = btn('REDO ↷', () => history.redo(), 'amber', true));
+  top.append(el('div', { class: 'sep' }));
   top.append(ui.pSong = btn('▶SONG', () => play('song'), '', true));
   top.append(ui.pPat = btn('▶PAT', () => play('pattern'), '', true));
   top.append(ui.pCur = btn('▶CUR', () => play('cursor'), '', true));
@@ -3224,8 +3332,8 @@ function buildTop() {
   top.append(ui.loop = btn('LOOP', () => { state.loop = !state.loop; player.loop = state.loop; refreshTransport(); }));
   top.append(el('div', { class: 'sep' }));
   const tempo = () => { markDirty(); if (engine.ready) engine.mixer.setTempo(sched.playing ? player.bpm : song.bpm, sched.playing ? player.speed : song.speed); };
-  top.append(new NumBox('BPM', () => song.bpm, v => { song.bpm = v; if (sched.playing) player.bpm = v; tempo(); }, { min: 32, max: 255, px: 4 }).el);
-  top.append(new NumBox('SPEED', () => song.speed, v => { song.speed = v; if (sched.playing) player.speed = v; tempo(); }, { min: 1, max: 31, px: 14 }).el);
+  top.append(new NumBox('BPM', () => song.bpm, v => { song.bpm = v; if (sched.playing) player.bpm = v; tempo(); }, { min: 32, max: 255, px: 4, hist: 'BPM' }).el);
+  top.append(new NumBox('SPEED', () => song.speed, v => { song.speed = v; if (sched.playing) player.speed = v; tempo(); }, { min: 1, max: 31, px: 14, hist: 'speed' }).el);
   top.append(new NumBox('OCT', () => state.octave, v => { state.octave = v; refreshPad(); }, { min: 0, max: 8, px: 20 }).el);
   top.append(new NumBox('STEP', () => state.step, v => state.step = v, { min: 0, max: 16, px: 14 }).el);
   top.append(el('div', { class: 'sep' }));
@@ -3268,7 +3376,8 @@ function renderSide() {
   } else {
     c.append(btn('PAT-', () => orderOps.pat(-1)), btn('PAT+', () => orderOps.pat(1)), btn('NEW', () => orderOps.add(), 'amber'),
       btn('INS', () => orderOps.ins()), btn('DEL', () => orderOps.del(), 'red'), btn('CLONE', () => orderOps.clone(), 'amber'));
-    const rows = new NumBox('ROWS', () => curPat().rows, v => { editPat(p => p.resize(v)); state.row = Math.min(state.row, v - 1); state.sel = null; patView.clampScroll(); }, { min: 16, max: 256, step: 16, px: 5, cls: 'span3', fmt: v => v + ' (' + hex(v - 1) + ')' });
+    const rows = new NumBox('ROWS', () => curPat().rows, v => { curPat().resize(v); markDirty(); patView.dirty = true; state.row = Math.min(state.row, v - 1); state.sel = null; patView.clampScroll(); },
+      { min: 16, max: 256, step: 16, px: 5, cls: 'span3', fmt: v => v + ' (' + hex(v - 1) + ')', begin: () => undo.snap(curPatIndex()) });
     rows.el.style.minHeight = '44px';
     c.append(rows.el);
     c.append(ui.olist = el('div', { class: 'olist span3' }));
@@ -3386,7 +3495,11 @@ function buildDial() {
     .forEach(([l, f]) => nav.append(btn(l, f, 'n', true)));
   ui.dTitle = el('span', { class: 'dt' }); ui.dVal = el('span', { class: 'dv' });
   ui.dTarget = el('select', { id: 'auto-target', class: 'tsel' });
-  ui.dTarget.addEventListener('change', () => { song.tracks[state.track].auto = ui.dTarget.value; markDirty(); refreshDial(); });
+  ui.dTarget.addEventListener('change', () => {
+    const t = song.tracks[state.track];
+    history.push(paramEntry({ obj: t, apply() { } }, 'auto', t.auto, 'automation target'));
+    t.auto = ui.dTarget.value; markDirty(); refreshDial(); patView.dirty = true;
+  });
   ui.dSl = el('div', { class: 'dsl' }, el('div', { class: 'trk' }, ui.dFill = el('i')), ui.dThumb = el('b'));
   // first touch snapshots undo; holding the slider during playback records into every row the playhead passes
   let id = null;
@@ -3460,7 +3573,10 @@ function buildInstr() {
   ui.iname = btn('01', () => {
     const ins = curInst();
     const inp = el('input', { id: 'iname-edit', value: ins.name, maxlength: '20', style: 'width:150px;background:#08100d;color:var(--acc);border:1px solid var(--acc);border-radius:4px;font:700 13px var(--font);padding:0 8px;text-transform:uppercase' });
-    const done = () => { ins.name = inp.value.slice(0, 20).toUpperCase(); inp.replaceWith(ui.iname); markDirty(); refreshAll(); };
+    const done = () => {
+      const nn = inp.value.slice(0, 20).toUpperCase();
+      if (nn !== ins.name) { const idx = state.inst; history.push(paramEntry({ get obj() { return song.instruments[idx]; }, apply() { } }, 'name', ins.name, 'rename')); }
+      ins.name = nn; inp.replaceWith(ui.iname); markDirty(); refreshAll(); };
     inp.addEventListener('keydown', e => { if (e.key === 'Enter') inp.blur(); });
     inp.addEventListener('blur', done);
     ui.iname.replaceWith(inp); inp.focus(); inp.select();
@@ -3481,6 +3597,7 @@ function buildInstr() {
       const b = ui.clrInst;   // two-tap confirm (no confirm() dialog)
       if (!b.dataset.armed) { b.dataset.armed = '1'; b.textContent = 'TAP AGAIN'; setTimeout(() => { delete b.dataset.armed; b.textContent = 'CLR INST'; }, 2500); return; }
       delete b.dataset.armed; b.textContent = 'CLR INST';
+      history.push(instEntry(state.inst, 'clear instrument'));
       const old = curInst().sampleId; song.instruments[state.inst] = new Instrument();
       gcSample(old); markDirty();
       engine.setInst(state.inst); waveView.fit(); refreshAll(); renderParams();
@@ -3506,8 +3623,8 @@ function buildInstr() {
   };
   ui.wSynth = el('div', { class: 'grp' }, el('div', { class: 'btn', style: 'color:var(--dim)', text: 'PRESET' }), ui.presetSel,
     btn('◂', () => stepPreset(-1)), btn('▸', () => stepPreset(1)),
-    btn('RANDOM', () => { const ins = curInst(); randomizeParams(ins); ins.preset = 'RANDOM'; if (!ins.name || ins.name === ins.preset || Object.keys(INSTRUMENT_TYPES[ins.type].presets).includes(ins.name)) ins.name = 'RANDOM'; engine.markInst(state.inst); renderParams(); refreshAll(); }, 'amber'),
-    btn('INIT', () => { const ins = curInst(); ins.p = defaultParams(ins.type); ins.preset = ''; engine.markInst(state.inst); renderParams(); refreshAll(); }, 'red'));
+    btn('RANDOM', () => { history.push(instEntry(state.inst, 'randomize')); const ins = curInst(); randomizeParams(ins); ins.preset = 'RANDOM'; if (!ins.name || ins.name === ins.preset || Object.keys(INSTRUMENT_TYPES[ins.type].presets).includes(ins.name)) ins.name = 'RANDOM'; engine.markInst(state.inst); renderParams(); refreshAll(); }, 'amber'),
+    btn('INIT', () => { history.push(instEntry(state.inst, 'init')); const ins = curInst(); ins.p = defaultParams(ins.type); ins.preset = ''; engine.markInst(state.inst); renderParams(); refreshAll(); }, 'red'));
   wb.append(ui.wSynth);
   const sel = $('#ipage');
   sel.addEventListener('change', () => { state.instPage = +sel.value; renderParams(); });
@@ -3533,7 +3650,10 @@ function renderParams() {
   }
   for (const pd of pg.params) { const pb = new ParamBox(pd); paramBoxes.push(pb); box.append(pb.el); }
 }
-function refreshParams() { paramBoxes.forEach(p => p.refresh()); }
+function refreshParams() {
+  if ($('#ipage').dataset.type !== curInst().type) return renderParams();   // boxes belong to another instrument type
+  paramBoxes.forEach(p => p.refresh());
+}
 function refreshInstr() {
   const ins = curInst();
   ui.iname.textContent = hex(state.inst) + ' ' + (ins.name || '(empty)');
@@ -3589,7 +3709,48 @@ function renderMixer() {
   ui.masterVu = strip('MASTER', 'master', MASTER_PARAMS, mixBind(() => song.master, () => engine.mixer.updateMaster()));
   strip('REVERB', 'fx', REV_PARAMS, mixBind(() => song.fx, () => engine.mixer.updateFx()));
   strip('DELAY', 'fx', DLY_PARAMS, mixBind(() => song.fx, () => engine.mixer.updateFx()));
+  const lbls = $('#mix-hbar .lbls');
+  lbls.innerHTML = '';
+  ['T1', 'T2', 'T3', 'T4', 'T5', 'T6', 'T7', 'T8', 'MST', 'REV', 'DLY'].forEach(t => lbls.append(el('span', { text: t })));
   refreshMixer();
+  if (ui.mixScrollUpdate) requestAnimationFrame(ui.mixScrollUpdate);
+}
+// mixer navigation: the strips don't react to swipes; these bars scroll them.
+// Drag the green frame, or tap a spot (e.g. a strip label) to jump there.
+function initMixScroll() {
+  const box = $('#strips'), hb = $('#mix-hbar'), vb = $('#mix-vbar'), lbls = hb.querySelector('.lbls');
+  const ht = hb.querySelector('b'), vt = vb.querySelector('b');
+  const update = () => {
+    const W = box.scrollWidth, w = box.clientWidth, H = box.scrollHeight, h = box.clientHeight, lw = lbls.clientWidth, vh = vb.clientHeight;
+    ht.style.left = (box.scrollLeft / W * lw) + 'px'; ht.style.width = Math.max(24, Math.min(1, w / W) * lw) + 'px';
+    vt.style.top = (box.scrollTop / H * vh) + 'px'; vt.style.height = Math.max(24, Math.min(1, h / H) * vh) + 'px';
+    vb.style.visibility = H > h + 2 ? 'visible' : 'hidden';
+  };
+  const drag = (bar, area, axis) => {
+    let id = null, p0 = 0, s0 = 0;
+    const pos = e => axis === 'x' ? e.clientX : e.clientY;
+    bar.addEventListener('pointerdown', e => {
+      e.preventDefault(); id = e.pointerId; bar.setPointerCapture(id);
+      const r = area().getBoundingClientRect(), t = (axis === 'x' ? ht : vt).getBoundingClientRect(), p = pos(e);
+      const inThumb = axis === 'x' ? p >= t.left && p <= t.right : p >= t.top && p <= t.bottom;
+      if (!inThumb) {   // jump: center the view on the tapped spot
+        const f = axis === 'x' ? (p - r.left) / r.width : (p - r.top) / r.height;
+        if (axis === 'x') box.scrollLeft = f * box.scrollWidth - box.clientWidth / 2; else box.scrollTop = f * box.scrollHeight - box.clientHeight / 2;
+      }
+      p0 = p; s0 = axis === 'x' ? box.scrollLeft : box.scrollTop;
+    });
+    bar.addEventListener('pointermove', e => {
+      if (e.pointerId !== id) return;
+      const r = area().getBoundingClientRect(), d = pos(e) - p0;
+      if (axis === 'x') box.scrollLeft = s0 + d * box.scrollWidth / r.width; else box.scrollTop = s0 + d * box.scrollHeight / r.height;
+    });
+    const up = e => { if (e.pointerId === id) id = null; };
+    bar.addEventListener('pointerup', up); bar.addEventListener('pointercancel', up);
+  };
+  drag(hb, () => lbls, 'x'); drag(vb, () => vb, 'y');
+  box.addEventListener('scroll', update);
+  new ResizeObserver(update).observe(box);
+  ui.mixScrollUpdate = update;
 }
 function refreshMixer() {
   mixBoxes.forEach(b => b.refresh());
@@ -3613,6 +3774,8 @@ function buildFile() {
   const fp = $('#filepane'), projIn = el('input', { type: 'file', id: 'projfile', hidden: '' }), modIn = el('input', { type: 'file', id: 'modfile', hidden: '' });
   ui.title = el('input', { id: 'song-title', class: 'tin', maxlength: '20', spellcheck: 'false' });
   ui.title.addEventListener('input', () => { song.title = ui.title.value.toUpperCase(); markDirty(); });
+  ui.title.addEventListener('focus', () => { ui.titleBefore = song.title; });
+  ui.title.addEventListener('blur', () => { if (ui.titleBefore != null && ui.titleBefore !== song.title) history.push(paramEntry({ obj: song, apply() { } }, 'title', ui.titleBefore, 'song title')); ui.titleBefore = null; });
   ui.newBtn = btn('NEW SONG', () => {
     const b = ui.newBtn;
     if (!b.dataset.armed) { b.dataset.armed = '1'; b.textContent = 'TAP AGAIN'; setTimeout(() => { delete b.dataset.armed; b.textContent = 'NEW SONG'; }, 2500); return; }
@@ -3776,7 +3939,11 @@ $('#helptext').innerHTML = `<b>MOBTRACK — quick reference</b>   (tap anywhere 
 <b>INSTRUMENT</b>  LOAD (wav/mp3/ogg) or REC (mic).  Waveform: pinch = zoom, drag = pan (NAV) or select (SELECT)
  Drag the flags: S/E = start/end (top), LS/LE = loop (bottom).  SNAP0 snaps markers to zero crossings.
  Destructive edits act on the selection (or the whole sample); TRIM keeps selection or S..E.  UNDO per sample.
- Param boxes: drag the slider bar (or drag the box up/down), double-tap resets, integer params: tap left/right half = -/+.
+ Param boxes: drag the slider bar sideways (taps never move it), or drag the box up/down. Double-tap resets,
+ integer params: tap left/right half = -/+.  In MIX only the slider bars edit; move around with the bars at the
+ bottom (tap T1-T8 / MST / REV / DLY to jump) and on the right.
+
+<b>UNDO / REDO</b> (top bar) undo everything: pattern edits, values, sample edits, presets, instruments, order list.
  SLICE page: EQUAL or DETECT (transients) → KEYS (slice n plays at ROOT+n) or → INSTRS (one instrument per slice)
 
 <b>SYNTHS</b>  INST tab → type selector: BASS, FM, PAD, LEAD. PRESET list, ◂ ▸, RANDOM, INIT.  POLY = max voices.
@@ -3797,8 +3964,8 @@ $('#helptext').innerHTML = `<b>MOBTRACK — quick reference</b>   (tap anywhere 
 function boot() {
   patView = new PatternView($('#pat'));
   waveView = new WaveView($('#wave'));
-  buildTop(); buildSide(); buildPad(); buildInstr(); buildFile(); renderMixer();
-  refreshAll();
+  buildTop(); buildSide(); buildPad(); buildInstr(); buildFile(); initMixScroll(); renderMixer();
+  refreshAll(); refreshUndoBtns();
   requestAnimationFrame(frame);
   let saved = null;
   const start = async restore => {
