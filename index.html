@@ -372,6 +372,38 @@ class SamplerVoice {
     this.pos = st + clamp(sf, 0, 0.999) * (en - st);
     this.amp.set(p.ampA, p.ampD, p.ampS, p.ampR); this.amp.gate();
     this.fenv.set(p.fltA, p.fltD, p.fltS, p.fltR); this.fenv.gate();
+    // WARP (1 BEATS / 2 MPC): this.pos becomes a timeline that moves at tempo speed; grains replay it at the pitch rate
+    this.eng = eng;
+    this.warp = this.slice ? 0 : (p.warp | 0);
+    if (this.warp) { this.gA = { pos: 0, age: 0, len: 1, on: false }; this.gB = { pos: 0, age: 0, len: 1, on: false }; this.gc = 0; this.useB = false; this.firstGrain = true; this.ending = false; }
+  }
+  // one grain: BEATS = Hann window, 50% overlap (smooth); MPC = flat chunk with 2ms edges (gritty, stuttery)
+  grain(g, dL, dR, len, ip) {
+    if (!g.on) return;
+    const a = g.age / g.len;
+    let w;
+    if (g.first && a < 0.5) w = 1;   // first grain starts at full level so the attack/transient survives
+    else if (this.warp === 1) w = 0.5 - 0.5 * Math.cos(6.283185307179586 * a);
+    else w = g.age < this.F ? g.age / this.F : g.age > g.len - this.F ? (g.len - g.age) / this.F : 1;
+    if (this.loop && g.pos >= this.le) g.pos -= this.ll;
+    const pos = g.pos;
+    if (pos >= 0 && pos < (this.loop ? len - 1 : this.en)) { this.wl += readS(dL, pos, len, ip) * w; if (dR) this.wr += readS(dR, pos, len, ip) * w; }
+    g.pos += this.rate;
+    if (++g.age >= g.len) g.on = false;
+  }
+  warpTick(dL, dR, len, ip) {
+    let T = this.pos + this.tRate;
+    if (this.loop) { if (T >= this.le) T = this.ls + ((T - this.ls) % this.ll); }
+    else if (T >= this.en) this.ending = true;
+    this.pos = T;
+    if (!this.ending && --this.gc <= 0) {
+      const g = (this.useB = !this.useB) ? this.gB : this.gA;
+      g.pos = T; g.age = 0; g.len = this.G; g.on = true; g.first = this.firstGrain; this.firstGrain = false; this.gc = this.hop;
+    }
+    this.wl = 0; this.wr = 0;
+    this.grain(this.gA, dL, dR, len, ip); this.grain(this.gB, dL, dR, len, ip);
+    if (!dR) this.wr = this.wl;
+    if (this.ending && !this.gA.on && !this.gB.on) this.done = true;
   }
   release() { this.amp.release(); this.fenv.release(); }
   kill() { this.amp.fast(); this.dying = true; }
@@ -391,6 +423,12 @@ class SamplerVoice {
     if (p.l2Dest > 0 && p.l2Dest < 5 && p.l2Depth > 0) this.mod(p.l2Dest, this.l2.tick(p.l2Wave, p.l2Rate, CR), p.l2Depth, m);
     const rel = (p.keytrack && !this.slice) ? this.pitch - p.root : this.pitch - this.trig;
     this.rate = this.smp.sr / sampleRate * Math.pow(2, (rel + p.coarse + p.fine * 0.01 + m.pm) / 12);
+    if (this.warp) {   // START..END lasts warpBeats beats at the current song tempo, whatever the pitch
+      this.tRate = Math.max(1, this.en - this.st) / (Math.max(0.01, p.warpBeats * this.eng.beatSec) * sampleRate);
+      this.G = Math.max(64, Math.round(p.grain * 0.001 * sampleRate));
+      this.F = Math.max(8, Math.min(this.G >> 1, Math.round(0.002 * sampleRate)));
+      this.hop = this.warp === 1 ? this.G >> 1 : this.G - this.F;
+    }
     this.amp.set(p.ampA, p.ampD, p.ampS, p.ampR);
     this.tgt = this.vol * p.vol * m.am;
     this.ft = p.fltType | 0;
@@ -422,27 +460,32 @@ class SamplerVoice {
     for (let i = a; i < b; i++) {
       if (this.cr <= 0) this.control(p);
       this.cr--;
-      const pos = this.pos, ip = this.interp;
-      let l = readS(dL, pos, len, ip), r = dR ? readS(dR, pos, len, ip) : l;
-      if (this.xf > 0 && pos > this.le - this.xf) {           // loop crossfade
-        const k = (pos - (this.le - this.xf)) / this.xf, q = pos - this.ll;
-        l = l * (1 - k) + readS(dL, q, len, ip) * k;
-        r = dR ? r * (1 - k) + readS(dR, q, len, ip) * k : l;
+      const ip = this.interp;
+      let l, r;
+      if (this.warp) { this.warpTick(dL, dR, len, ip); l = this.wl; r = this.wr; }
+      else {
+        const pos = this.pos;
+        l = readS(dL, pos, len, ip); r = dR ? readS(dR, pos, len, ip) : l;
+        if (this.xf > 0 && pos > this.le - this.xf) {           // loop crossfade
+          const k = (pos - (this.le - this.xf)) / this.xf, q = pos - this.ll;
+          l = l * (1 - k) + readS(dL, q, len, ip) * k;
+          r = dR ? r * (1 - k) + readS(dR, q, len, ip) * k : l;
+        }
+        let np = pos + this.rate * this.dir;
+        switch (this.loop) {
+          case 0: if (np >= this.en) this.done = true; break;
+          case 1: if (np >= this.le) np = this.ls + ((np - this.ls) % this.ll); break;
+          case 2:
+            if (this.dir > 0) { if (np >= this.le) { np = clamp(2 * this.le - np, this.ls, this.le); this.dir = -1; } }
+            else if (np < this.ls) { np = clamp(2 * this.ls - np, this.ls, this.le); this.dir = 1; }
+            break;
+          case 3:
+            if (this.dir > 0) { if (np >= this.le) { np = clamp(2 * this.le - np, this.ls, this.le); this.dir = -1; } }
+            else if (np < this.ls) { np = this.le - ((this.ls - np) % this.ll); }
+            break;
+        }
+        this.pos = np;
       }
-      let np = pos + this.rate * this.dir;
-      switch (this.loop) {
-        case 0: if (np >= this.en) this.done = true; break;
-        case 1: if (np >= this.le) np = this.ls + ((np - this.ls) % this.ll); break;
-        case 2:
-          if (this.dir > 0) { if (np >= this.le) { np = clamp(2 * this.le - np, this.ls, this.le); this.dir = -1; } }
-          else if (np < this.ls) { np = clamp(2 * this.ls - np, this.ls, this.le); this.dir = 1; }
-          break;
-        case 3:
-          if (this.dir > 0) { if (np >= this.le) { np = clamp(2 * this.le - np, this.ls, this.le); this.dir = -1; } }
-          else if (np < this.ls) { np = this.le - ((this.ls - np) % this.ll); }
-          break;
-      }
-      this.pos = np;
       if (this.srInc < 1) { this.srPh += this.srInc; if (this.srPh >= 1) { this.srPh -= 1; this.hL = l; this.hR = r; } l = this.hL; r = this.hR; }
       if (this.q) { const q = this.q; l = Math.round(l * q) / q; r = Math.round(r * q) / q; }
       if (this.ft) {
@@ -807,6 +850,7 @@ class TrackerEngine extends AudioWorkletProcessor {
     for (let i = 0; i < NCH; i++) this.ch.push({ voice: null, vol: 1, pan: 0, out: i < TRACKS ? i : 0 });
     this.voices = []; this.q = []; this.qh = 0;
     this.peak = new Float32Array(TRACKS * 2); this.vuN = 0; this.watch = 0; this.buses = new Map();
+    this.beatSec = 0.48;   // 1 beat = 4 rows (updated by 'tempo' events; used by WARP)
     this.port.onmessage = e => this.onMsg(e.data);
   }
   getBus(instId, out) {
@@ -866,6 +910,7 @@ class TrackerEngine extends AudioWorkletProcessor {
     vs.push(v);
   }
   apply(e) {
+    if (e.k === 'tempo') { this.beatSec = 4 * e.speed * 2.5 / e.bpm; return; }
     if (e.k === 'ip') {   // automation: timed instrument parameter change (continuous params slew ~10ms)
       const r = this.insts.get(e.inst);
       if (!r) return;
@@ -1185,6 +1230,11 @@ const SAMPLER_PAGES = [
     P('loopMode', 'MODE', 0, 3, 0, { options: ['OFF', 'FWD', 'PINGPONG', 'REVERSE'] }),
     P('loopStart', 'L.START', 0, 'len', 0, { int: 1, fmt: 'frames' }), P('loopEnd', 'L.END', 0, 'len', 0, { int: 1, fmt: 'frames' }),
     P('xfade', 'XFADE', 0, 'len', 0, { int: 1, fmt: 'frames' }),
+  ] },
+  { name: 'WARP', params: [
+    P('warp', 'WARP', 0, 2, 0, { options: ['OFF', 'BEATS', 'MPC'] }),
+    P('warpBeats', 'BEATS', 0.25, 64, 4, { exp: 1, stepv: 0.25, fmt: 'beats' }),
+    P('grain', 'GRAIN', 8, 250, 50, { exp: 1, int: 1, unit: 'ms' }),
   ] },
   { name: 'SLICE', custom: 'slice' },
   { name: 'TUNE', params: [
@@ -1774,6 +1824,7 @@ class Mixer {
   // delay time follows the tracker tempo (4 rows = 1 beat); called on BPM/speed changes incl. Fxx during playback
   setTempo(bpm, speed, t, inst) {
     this.bpm = bpm; this.speed = speed;
+    if (this.engine) this.engine.schedule([{ t: t != null ? t : 0, k: 'tempo', bpm, speed }]);   // WARP samples follow tempo too
     const dt = Math.min(4.9, (DLY_ROWS[song.fx.dlyDiv | 0] || 3) * speed * 2.5 / bpm);
     for (const d of [this.dL, this.dR]) {
       if (inst) { d.delayTime.cancelScheduledValues(0); d.delayTime.value = dt; }
@@ -1821,6 +1872,7 @@ class AudioEngine {
     this.node.onprocessorerror = () => toast('Audio engine crashed - reload the page', 8000);
     this.mixer = new Mixer(this.ctx, this.node);
     this.ready = true;
+    this.mixer.engine = this;
     if (!ctxIn) document.addEventListener('visibilitychange', () => { if (!document.hidden && this.ctx.state !== 'running') this.ctx.resume(); });
   }
   sync() { return new Promise(r => { this.pong = r; this.post({ type: 'ping' }); }); }
@@ -2479,6 +2531,7 @@ function fromNorm(pd, n, max) {
   n = clamp(n, 0, 1);
   let v = pd.exp ? pd.min * Math.pow(max / pd.min, n) : pd.min + n * (max - pd.min);
   if (pd.int || pd.options) v = Math.round(v);
+  if (pd.stepv) v = Math.max(pd.min, Math.round(v / pd.stepv) * pd.stepv);
   return v;
 }
 function fmtParam(pd, v, ins) {
@@ -2497,6 +2550,7 @@ function fmtParam(pd, v, ins) {
     case 'db': return (v > 0 ? '+' : '') + v.toFixed(1) + 'dB';
     case 'ratio': return v.toFixed(1) + ':1';
     case 'hexvol': return hex(v);
+    case 'beats': return (Number.isInteger(v) ? v : +v.toFixed(2)) + (v === 1 ? ' beat' : ' beats');
     case 'wt': { const a = Math.floor(v + 1e-6), f = v - a; return f < 0.05 ? WT_NAMES[a] : WT_NAMES[a].slice(0, 3) + '>' + (WT_NAMES[a + 1] || '').slice(0, 3); }
   }
   const a = Math.abs(v), s = pd.int ? String(v) : a < 10 ? v.toFixed(2) : a < 100 ? v.toFixed(1) : v.toFixed(0);
@@ -2977,6 +3031,13 @@ class WaveView {
       g.fillStyle = '#ff5cf0';
       ins.slices.forEach((f, i) => { const x = this.f2x(f); if (x < -2 || x > W + 2) return; g.fillRect(x, 0, 1, H); g.fillText(String(i + 1), x + 3, 38); });
     }
+    // WARP: beat grid over START..END
+    if (p.warp && p.warpBeats > 0) {
+      const nb = p.warpBeats;
+      g.fillStyle = 'rgba(255,210,74,.35)';
+      for (let b = 1; b < nb; b++) { const x = this.f2x(st + (en - st) * b / nb); if (x > 0 && x < W) g.fillRect(x, 0, 1, H); }
+      g.fillStyle = '#ffd24a'; g.fillText((p.warp === 2 ? 'MPC WARP  ' : 'WARP  ') + fmtParam({ fmt: 'beats' }, nb), 8, H - 34);
+    }
     // markers with flags (flags are the drag handles)
     for (const m of MARKERS) {
       if (m.loop && !p.loopMode) continue;
@@ -3221,7 +3282,10 @@ async function renderSong(onProgress) {
   const sr = 44100, pl = new Player();
   pl.loop = false; pl.detectLoop = true; pl.start(song, 0, 0, 'song');
   const evs = [], tempo = [];
-  let t = 0.02;
+  // 0.3s pre-roll: the compressor/limiter nodes start "cold" in a fresh offline context and would squash the
+  // first hit; they settle during the silent pre-roll, which encodeWAV then cuts off
+  const PREROLL = 0.3;
+  let t = PREROLL;
   while (!pl.ended && t < 15 * 60) { pl.step(t, evs); tempo.push(...pl.tempoEv); pl.tempoEv.length = 0; t += pl.tickDur; }
   for (let c = 0; c < TRACKS; c++) evs.push({ t, k: 'off', ch: c });
   const dur = t + 3 + Math.min(6, song.fx.revDecay);
@@ -3234,13 +3298,15 @@ async function renderSong(onProgress) {
   await eng.sync();   // make sure the worklet has every sample, instrument and event before rendering
   for (let s = 2; s < dur - 0.1; s += 2) ctx.suspend(s).then(() => { onProgress(s / dur); ctx.resume(); });
   const buf = await ctx.startRendering();
-  return { buf, songEnd: t };
+  return { buf, songEnd: t, start: PREROLL - 0.02 };
 }
-function encodeWAV(buf, minLen) {
-  const ch = buf.numberOfChannels, sr = buf.sampleRate, data = [...Array(ch)].map((_, c) => buf.getChannelData(c));
-  let n = buf.length;
+function encodeWAV(buf, minLen, startSec = 0) {
+  const ch = buf.numberOfChannels, sr = buf.sampleRate, s0 = Math.round(startSec * sr);
+  const data = [...Array(ch)].map((_, c) => buf.getChannelData(c).subarray(s0));
+  minLen -= s0;
+  let n = buf.length - s0;
   while (n > minLen && data.every(d => Math.abs(d[n - 1]) < 1e-4)) n--;      // trim silent tail
-  n = Math.min(buf.length, n + Math.round(sr * 0.05));
+  n = Math.min(buf.length - s0, n + Math.round(sr * 0.05));
   const ab = new ArrayBuffer(44 + n * ch * 2), dv = new DataView(ab);
   const ws = (o, s) => { for (let i = 0; i < s.length; i++) dv.setUint8(o + i, s.charCodeAt(i)); };
   ws(0, 'RIFF'); dv.setUint32(4, 36 + n * ch * 2, true); ws(8, 'WAVE'); ws(12, 'fmt '); dv.setUint32(16, 16, true);
@@ -3261,8 +3327,8 @@ async function exportWav() {
   if (sched.playing) stop();
   try {
     ui.wavStatus.textContent = 'Rendering...';
-    const { buf, songEnd } = await renderSong(p => ui.wavStatus.textContent = 'Rendering ' + Math.round(p * 100) + '%');
-    lastWav = new File([encodeWAV(buf, Math.round(songEnd * buf.sampleRate))], fname('.wav'), { type: 'audio/wav' });
+    const { buf, songEnd, start } = await renderSong(p => ui.wavStatus.textContent = 'Rendering ' + Math.round(p * 100) + '%');
+    lastWav = new File([encodeWAV(buf, Math.round(songEnd * buf.sampleRate), start)], fname('.wav'), { type: 'audio/wav' });
     saveBlob(lastWav, lastWav.name);
     ui.wavStatus.textContent = lastWav.name + '  ' + (lastWav.size / 1048576).toFixed(1) + ' MB  (saved to Downloads)';
     ui.shareBtn.hidden = !(navigator.canShare && navigator.canShare({ files: [lastWav] }));
@@ -3856,6 +3922,17 @@ function buildInstr() {
   const sel = $('#ipage');
   sel.addEventListener('change', () => { state.instPage = +sel.value; renderParams(); });
 }
+// WARP: guess how many beats START..END lasts at the song tempo (nearest quarter beat) and switch warp on
+function fitWarp() {
+  const ins = curInst(), s = instSample(ins);
+  if (!s) return toast('No sample');
+  const secs = ((ins.p.sEnd || s.len) - ins.p.sStart) / s.sr, beatSec = 4 * song.speed * 2.5 / song.bpm;
+  const beats = clamp(Math.round(secs / beatSec * 4) / 4, 0.25, 64);
+  history.push(instEntry(state.inst, 'fit warp'));
+  ins.p.warpBeats = beats; if (!ins.p.warp) ins.p.warp = 1;
+  engine.markInst(state.inst); refreshParams(); waveView.dirty = true;
+  toast(secs.toFixed(2) + 's at ' + song.bpm + ' BPM = ' + beats + ' beats (the loop now follows the tempo)');
+}
 let paramBoxes = [];
 function renderParams() {
   const ins = curInst(), T = INSTRUMENT_TYPES[ins.type], sel = $('#ipage');
@@ -3876,6 +3953,7 @@ function renderParams() {
     return;
   }
   for (const pd of pg.params) { const pb = new ParamBox(pd); paramBoxes.push(pb); box.append(pb.el); }
+  if (pg.name === 'WARP') box.append(btn('FIT TO TEMPO', fitWarp, 'amber'), el('div', { class: 'btn', style: 'color:var(--dim)', text: '1 beat = 4 rows' }));
 }
 function refreshParams() {
   if ($('#ipage').dataset.type !== curInst().type) return renderParams();   // boxes belong to another instrument type
@@ -4179,6 +4257,9 @@ $('#helptext').innerHTML = `<b>MOBTRACK — quick reference</b>   (tap anywhere 
  bottom (tap T1-T8 / MST / REV / DLY to jump) and on the right.
 
 <b>UNDO / REDO</b> (top bar) undo everything: pattern edits, values, sample edits, presets, instruments, order list.
+ WARP page: OFF = classic (pitch changes speed). BEATS = time-stretch: START..END always lasts BEATS beats at the
+   song tempo (4 rows = 1 beat), notes change pitch only. MPC = old MPC-style stretch: hard-edged grains, gritty
+   and stuttery (bigger GRAIN = choppier). FIT TO TEMPO guesses BEATS from the length. Follows BPM/speed and Fxx.
  SLICE page: EQUAL or DETECT (transients) → KEYS (slice n plays at ROOT+n) or → INSTRS (one instrument per slice)
 
 <b>SYNTHS</b>  INST tab → type selector: BASS, FM, PAD, LEAD. PRESET list, ◂ ▸, RANDOM, INIT.  POLY = max voices.
