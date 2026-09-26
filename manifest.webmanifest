@@ -1,6 +1,6 @@
 {
-  "name": "MOBTRACK Tracker",
-  "short_name": "MOBTRACK",
+  "name": "DATTRACK Tracker",
+  "short_name": "DATTRACK",
   "description": "8-track Amiga-style music tracker with sampler, synths, mixer and effects.",
   "id": "/mobtrack/",
   "start_url": "./",
