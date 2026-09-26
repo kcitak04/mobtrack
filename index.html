@@ -183,6 +183,14 @@ main{flex:1;min-height:0;position:relative}
 .hbar .lbls span{flex:1;text-align:center;line-height:34px;font-size:11px;font-weight:700;color:var(--dim);letter-spacing:1px}
 .btn.dis2{opacity:.4}
 .span2{grid-column:span 2}
+.btn.lane{color:#ff7ad9;overflow:hidden;text-overflow:ellipsis}
+.noteinfo{position:absolute;z-index:5;background:var(--panel);border:1px solid var(--acc);border-radius:var(--r);padding:6px 8px;
+  display:flex;flex-direction:column;gap:3px;max-width:260px;opacity:0;transition:opacity .35s;pointer-events:none;box-shadow:0 6px 20px #000a}
+.noteinfo.show{opacity:1}
+.noteinfo b{color:var(--acc);font-size:13px;white-space:nowrap}
+.noteinfo span{color:var(--text);font-size:11px}
+#pat-wrap .noteinfo canvas{position:static;inset:auto;display:block;width:220px;height:45px;border-radius:2px}
+.btn.fxlbl{min-width:0;padding:0 6px;color:var(--dim);writing-mode:vertical-rl;transform:rotate(180deg);font-size:10px;letter-spacing:1px}
 .btn.smp{background:var(--smpbg);color:var(--smp);border-color:var(--smp)}
 .dhead #kit-add{color:var(--smp);max-width:34%}
 .dial.smpmode .dt{color:var(--smp)}
@@ -472,9 +480,9 @@ class SamplerVoice {
   }
   render(outs, a, b) {
     if (this.done) return;
-    const p = this.inst.p, o = outs[this.out];
+    const p = this.inst.p, o = voiceDest(this, outs);
     if (!o) { this.done = true; return; }
-    const oL = o[0], oR = o[1] || o[0];
+    const oL = o[0], oR = o[1];
     const s = this.smp, dL = s.ch[0], dR = s.ch.length > 1 ? s.ch[1] : null, len = s.len, F = this.f;
     for (let i = a; i < b; i++) {
       if (this.cr <= 0) this.control(p);
@@ -617,7 +625,7 @@ class BassVoice extends SynthBase {
   }
   render(outs, a, b) {
     if (this.done) return;
-    const p = this.inst.p, o = outs[this.out], oL = o[0], oR = o[1], ld = this.ld;
+    const p = this.inst.p, o = voiceDest(this, outs), oL = o[0], oR = o[1], ld = this.ld;
     const w1 = p.o1Wave | 0, w2 = p.o2Wave | 0, l1 = p.o1Lvl, l2 = p.o2Lvl, ls = p.subLvl;
     for (let i = a; i < b; i++) {
       if (this.cr <= 0) this.control(p);
@@ -681,7 +689,7 @@ class FMVoice extends SynthBase {
   }
   render(outs, a, b) {
     if (this.done) return;
-    const p = this.inst.p, o = outs[this.out], oL = o[0], oR = o[1], E = this.envs, O = this.o, PH = this.ph;
+    const p = this.inst.p, o = voiceDest(this, outs), oL = o[0], oR = o[1], E = this.envs, O = this.o, PH = this.ph;
     for (let i = a; i < b; i++) {
       if (this.cr <= 0) this.control(p);
       this.cr--;
@@ -721,7 +729,7 @@ class PadVoice extends SynthBase {
     this.n = clamp(p.uni | 0, 1, 9);
     this.ph = new Float64Array(9).map(() => Math.random()); this.dt = new Float64Array(9); this.gl = new Float64Array(9); this.gr = new Float64Array(9);
     this.amp = new Env(1); this.fenv = new Env(CR); this.fL = new SVF(); this.fR = new SVF();
-    this.wph = Math.random(); this.bus = eng.getBus(e.inst, out);
+    this.wph = Math.random();
     this.amp.set(p.ampA, p.ampD, p.ampS, p.ampR); this.amp.gate(); this.fenv.gate();
   }
   control(p) {
@@ -747,9 +755,8 @@ class PadVoice extends SynthBase {
   }
   render(outs, a, b) {
     if (this.done) return;
-    const p = this.inst.p, bus = this.bus, BL = bus.L, BR = bus.R, n = this.n, PH = this.ph, DT = this.dt, GL = this.gl, GR = this.gr;
+    const p = this.inst.p, io = voiceDest(this, outs), BL = io[0], BR = io[1], n = this.n, PH = this.ph, DT = this.dt, GL = this.gl, GR = this.gr;
     const saw = !(p.osc | 0);
-    bus.used = true;
     for (let i = a; i < b; i++) {
       if (this.cr <= 0) this.control(p);
       this.cr--;
@@ -816,7 +823,7 @@ class LeadVoice extends SynthBase {
   osc(w, ph, dt, pw) { return w === 0 ? sawB(ph, dt) : w === 1 ? pulseB(ph, dt, pw) : triN(ph); }
   render(outs, a, b) {
     if (this.done) return;
-    const p = this.inst.p, o = outs[this.out], oL = o[0], oR = o[1];
+    const p = this.inst.p, o = voiceDest(this, outs), oL = o[0], oR = o[1];
     const w1 = p.o1Wave | 0, w2 = p.o2Wave | 0, sync = p.sync | 0;
     for (let i = a; i < b; i++) {
       if (this.cr <= 0) this.control(p);
@@ -838,24 +845,43 @@ class LeadVoice extends SynthBase {
   }
 }
 
-// Per-instrument output bus with stereo chorus (used by PAD)
+// Per-instrument output bus: voices of an instrument that has effects render here first.
+// Chain: PAD's built-in chorus -> instrument FX slot 1 -> slot 2 -> track output.
 function readDelay(b, pos) { if (pos < 0) pos += 4096; const i = pos | 0, f = pos - i; return b[i & 4095] * (1 - f) + b[(i + 1) & 4095] * f; }
-class ChorusBus {
+const instHasFx = ins => !!((ins.p.ifx1Type | 0) || (ins.p.ifx2Type | 0));
+const instUsesBus = ins => ins.type === 'pad' || instHasFx(ins);
+// where a voice writes: the instrument bus when it has effects, otherwise the track output directly
+function voiceDest(v, outs) {
+  if (instUsesBus(v.inst)) { const b = v.eng.getBus(v.instId, v.out); return b.io; }
+  const o = outs[v.out];
+  return o ? (o.length > 1 ? o : [o[0], o[0]]) : null;
+}
+class InstBus {
   constructor(instId, out) {
-    this.instId = instId; this.out = out; this.L = new Float32Array(128); this.R = new Float32Array(128);
+    this.instId = instId; this.out = out; this.L = new Float32Array(128); this.R = new Float32Array(128); this.io = [this.L, this.R];
     this.bl = new Float32Array(4096); this.br = new Float32Array(4096); this.w = 0; this.ph = 0; this.tail = 0; this.used = false;
+    this.fx1 = new FxUnit(); this.fx2 = new FxUnit();
   }
-  process(out, n, p) {
-    const oL = out[0], oR = out[1], mix = p.chMix, dep = p.chDepth * 0.006 * sampleRate, base = 0.011 * sampleRate, inc = p.chRate / sampleRate;
+  chorus(n, p) {
+    const L = this.L, R = this.R, mix = p.chMix, dep = p.chDepth * 0.006 * sampleRate, base = 0.011 * sampleRate, inc = p.chRate / sampleRate;
     for (let i = 0; i < n; i++) {
-      const l = this.L[i], r = this.R[i];
+      const l = L[i], r = R[i];
       this.bl[this.w] = l; this.br[this.w] = r;
       if ((this.ph += inc) >= 1) this.ph -= 1;
       const wl = readDelay(this.bl, this.w - base - dep * (0.5 + 0.5 * sinT(this.ph)));
       const wr = readDelay(this.br, this.w - base - dep * (0.5 + 0.5 * sinT(this.ph + 0.25)));
-      oL[i] += l * (1 - mix * 0.5) + wl * mix; oR[i] += r * (1 - mix * 0.5) + wr * mix;
-      this.w = (this.w + 1) & 4095; this.L[i] = 0; this.R[i] = 0;
+      L[i] = l * (1 - mix * 0.5) + wl * mix; R[i] = r * (1 - mix * 0.5) + wr * mix;
+      this.w = (this.w + 1) & 4095;
     }
+  }
+  process(out, n, inst) {
+    const p = inst.p, L = this.L, R = this.R;
+    if (inst.type === 'pad') this.chorus(n, p);
+    const t1 = p.ifx1Type | 0, t2 = p.ifx2Type | 0;
+    if (t1 && p.ifx1Mix > 0) { this.fx1.setType(t1); this.fx1.process(L, R, L, R, n, p.ifx1A, p.ifx1B, p.ifx1C, p.ifx1Mix); }
+    if (t2 && p.ifx2Mix > 0) { this.fx2.setType(t2); this.fx2.process(L, R, L, R, n, p.ifx2A, p.ifx2B, p.ifx2C, p.ifx2Mix); }
+    const oL = out[0], oR = out[1] || out[0];
+    for (let i = 0; i < n; i++) { oL[i] += L[i]; oR[i] += R[i]; L[i] = 0; R[i] = 0; }
   }
 }
 
@@ -876,7 +902,7 @@ class TrackerEngine extends AudioWorkletProcessor {
   getBus(instId, out) {
     const k = instId * 64 + out;
     let b = this.buses.get(k);
-    if (!b) { b = new ChorusBus(instId, out); this.buses.set(k, b); }
+    if (!b) { b = new InstBus(instId, out); this.buses.set(k, b); }
     b.used = true;
     return b;
   }
@@ -1011,10 +1037,11 @@ class TrackerEngine extends AudioWorkletProcessor {
       });
     }
     for (const [k, b] of this.buses) {
-      if (b.used) b.tail = sampleRate * 0.1 | 0; else b.tail -= n;
+      const bi = this.insts.get(b.instId);   // keep effect tails (delay/reverb) running a while after the last note
+      if (b.used) b.tail = sampleRate * (bi && instHasFx(bi) ? 4 : 0.1) | 0; else b.tail -= n;
       if (b.tail <= 0) { this.buses.delete(k); continue; }
       const inst = this.insts.get(b.instId), o = outputs[b.out];
-      if (inst && o) b.process(o, n, inst.p);
+      if (inst && o) b.process(o, n, inst);
       b.used = false;
     }
     const pk = this.peak;
@@ -1040,105 +1067,279 @@ class TrackerEngine extends AudioWorkletProcessor {
 }
 registerProcessor('tracker-engine', TrackerEngine);
 
-// Per-track insert effect. All controls are normalized 0..1 k-rate AudioParams so they can be
-// automated sample-accurately from the main thread (setValueAtTime / setTargetAtTime).
+// ---------- effect unit, shared by the per-track insert and the two FX slots inside every instrument ----------
 // type: 0 OFF 1 FILTER 2 DRIVE 3 CRUSH 4 CHORUS 5 FLANGER 6 PHASER 7 TREMOLO 8 AUTOPAN 9 RINGMOD
-class InsertFX extends AudioWorkletProcessor {
-  static get parameterDescriptors() {
-    return ['type', 'a', 'b', 'c', 'mix'].map(name => ({ name, defaultValue: name === 'type' ? 0 : name === 'mix' ? 1 : 0.5, minValue: 0, maxValue: name === 'type' ? 20 : 1, automationRate: 'k-rate' }));
-  }
-  constructor() { super(); this.bl = new Float32Array(8192); this.br = new Float32Array(8192); this.reset(); this.last = -1; }
-  reset() {
-    this.bl.fill(0); this.br.fill(0); this.w = 0; this.ph = 0; this.fL = new SVF(); this.fR = new SVF();
+//       10 DELAY 11 REVERB 12 WAVEFOLD 13 TAPE 14 COMB 15 FORMANT 16 FREQ SHIFT 17 GATE 18 WIDENER 19 ENV FILTER 20 COMP
+// a/b/c/mix are 0..1. process() may run in place (oL === L).
+const HILB_A = [0.6923878, 0.9360654322959, 0.9882295226860, 0.9987488452737].map(x => x * x);
+const HILB_B = [0.4021921162426, 0.8561710882420, 0.9722909545651, 0.9952884791278].map(x => x * x);
+const VOWELS = [[730, 1090, 2440], [530, 1840, 2480], [270, 2290, 3010], [570, 840, 2410], [300, 870, 2240]];   // A E I O U
+function rd8(b, pos) { if (pos < 0) pos += 8192; const i = pos | 0, f = pos - i; return b[i & 8191] * (1 - f) + b[(i + 1) & 8191] * f; }
+function rdN(b, pos) { const N = b.length; pos %= N; if (pos < 0) pos += N; const i = pos | 0, f = pos - i; return b[i] * (1 - f) + b[i + 1 < N ? i + 1 : 0] * f; }
+// 2nd-order allpass chain (4 stages) for the Hilbert pair of FREQ SHIFT; s holds x1,x2,y1,y2 per stage
+function hilb(s, A, x) {
+  for (let k = 0; k < 4; k++) { const j = k * 4, o = A[k] * (x + s[j + 3]) - s[j + 1]; s[j + 1] = s[j]; s[j] = x; s[j + 3] = s[j + 2]; s[j + 2] = o; x = o; }
+  return x;
+}
+class FxUnit {
+  constructor() { this.type = -1; }
+  setType(t) { if (t !== this.type) { this.type = t; this.reset(t); } }
+  reset(t) {
+    const sr = sampleRate, N = t === 10 ? Math.ceil(1.6 * sr) : 8192;
+    this.bl = new Float32Array(N); this.br = new Float32Array(N); this.w = 0; this.ph = 0; this.ph2 = 0;
+    this.fL = new SVF(); this.fR = new SVF(); this.fm = [0, 1, 2, 3, 4, 5].map(() => new SVF());
     this.apL = new Float64Array(6); this.apR = new Float64Array(6); this.fbL = 0; this.fbR = 0;
     this.lpL = 0; this.lpR = 0; this.dcL = 0; this.dcR = 0; this.hL = 0; this.hR = 0; this.cnt = 0;
+    this.env = 0; this.gate = 1; this.slp = 0; this.dI = [0, 0]; this.fbv = [0, 0];
+    if (t === 11) {   // Freeverb-style: 4 damped combs + 2 allpasses per side
+      const s = sr / 44100, mk = (len, sp) => ({ b: new Float32Array(Math.max(8, Math.round((len + sp) * s))), i: 0, f: 0 });
+      this.cl = [1116, 1188, 1277, 1356].map(x => mk(x, 0)); this.cr = [1116, 1188, 1277, 1356].map(x => mk(x, 23));
+      this.al = [556, 441].map(x => mk(x, 0)); this.ar = [556, 441].map(x => mk(x, 23));
+    }
+    if (t === 16) this.hs = [new Float64Array(16), new Float64Array(16), new Float64Array(16), new Float64Array(16)];
   }
   lfo(shape) { const s = Math.sin(this.ph * 6.283185307179586); if (!shape) return s; const k = 1 + shape * 20; return Math.tanh(s * k) / Math.tanh(k); }
-  process(inputs, outputs, P) {
-    const out = outputs[0], oL = out[0], oR = out[1] || out[0], n = oL.length, inp = inputs[0];
-    if (!inp || !inp.length) { oL.fill(0); oR.fill(0); return true; }
-    const L = inp[0], R = inp[1] || inp[0], type = Math.round(P.type[0]);
-    if (type !== this.last) { this.reset(); this.last = type; }
-    const a = P.a[0], b = P.b[0], c = P.c[0], mix = P.mix[0], dry = 1 - mix, sr = sampleRate;
-    if (type === 0 || mix <= 0) { oL.set(L); oR.set(R); return true; }
-    const rate = 0.05 * Math.pow(200, a);
+  process(L, R, oL, oR, n, a, b, c, mix) {
+    const dry = 1 - mix, sr = sampleRate, rate = 0.05 * Math.pow(200, a), type = this.type;
     switch (type) {
       case 1: {   // FILTER: cutoff, reso, mode LP/BP/HP
         const fc = Math.min(sr * 0.45, 20 * Math.pow(1000, a)), m = c < 0.34 ? 0 : c < 0.67 ? 2 : 1;
         this.fL.setup(fc, b * 0.95); this.fR.copy(this.fL);
-        for (let i = 0; i < n; i++) { oL[i] = L[i] * dry + this.fL.tick(L[i], m) * mix; oR[i] = R[i] * dry + this.fR.tick(R[i], m) * mix; }
+        for (let i = 0; i < n; i++) { const l = L[i], r = R[i]; oL[i] = l * dry + this.fL.tick(l, m) * mix; oR[i] = r * dry + this.fR.tick(r, m) * mix; }
         break;
       }
       case 2: {   // DRIVE: drive, tone, asymmetry
         const g = 1 + a * a * 40, comp = 1 / Math.pow(g, 0.5), off = c * 0.4, t0 = Math.tanh(g * off), k = 0.03 + 0.97 * b * b;
         for (let i = 0; i < n; i++) {
-          let yl = (Math.tanh(g * (L[i] + off)) - t0) * comp, yr = (Math.tanh(g * (R[i] + off)) - t0) * comp;
+          const l = L[i], r = R[i];
+          let yl = (Math.tanh(g * (l + off)) - t0) * comp, yr = (Math.tanh(g * (r + off)) - t0) * comp;
           this.dcL += (yl - this.dcL) * 0.001; this.dcR += (yr - this.dcR) * 0.001; yl -= this.dcL; yr -= this.dcR;
           this.lpL += (yl - this.lpL) * k; this.lpR += (yr - this.lpR) * k;
-          oL[i] = L[i] * dry + this.lpL * mix; oR[i] = R[i] * dry + this.lpR * mix;
+          oL[i] = l * dry + this.lpL * mix; oR[i] = r * dry + this.lpR * mix;
         }
         break;
       }
       case 3: {   // CRUSH: bits, downsample, gain
         const q = Math.pow(2, 15 - a * 15), hold = 1 + Math.floor(b * b * 63), g = 1 + c * 4;
         for (let i = 0; i < n; i++) {
-          if (this.cnt-- <= 0) { this.cnt = hold - 1; this.hL = Math.round(clamp(L[i] * g, -1, 1) * q) / q; this.hR = Math.round(clamp(R[i] * g, -1, 1) * q) / q; }
-          oL[i] = L[i] * dry + this.hL * mix; oR[i] = R[i] * dry + this.hR * mix;
+          const l = L[i], r = R[i];
+          if (this.cnt-- <= 0) { this.cnt = hold - 1; this.hL = Math.round(clamp(l * g, -1, 1) * q) / q; this.hR = Math.round(clamp(r * g, -1, 1) * q) / q; }
+          oL[i] = l * dry + this.hL * mix; oR[i] = r * dry + this.hR * mix;
         }
         break;
       }
       case 4: case 5: {   // CHORUS / FLANGER: rate, depth, feedback
         const fl = type === 5, base = (fl ? 0.001 : 0.018) * sr, dep = b * (fl ? 0.004 : 0.008) * sr, fb = c * (fl ? 0.9 : 0.6), inc = rate / sr;
         for (let i = 0; i < n; i++) {
+          const l = L[i], r = R[i];
           if ((this.ph += inc) >= 1) this.ph -= 1;
           const ml = base + dep * (0.5 + 0.5 * Math.sin(this.ph * 6.2832)), mr = base + dep * (0.5 + 0.5 * Math.cos(this.ph * 6.2832));
           const wl = rd8(this.bl, this.w - ml), wr = rd8(this.br, this.w - mr);
-          this.bl[this.w] = L[i] + wl * fb; this.br[this.w] = R[i] + wr * fb; this.w = (this.w + 1) & 8191;
-          oL[i] = L[i] * dry + wl * mix; oR[i] = R[i] * dry + wr * mix;
+          this.bl[this.w] = l + wl * fb; this.br[this.w] = r + wr * fb; this.w = (this.w + 1) & 8191;
+          oL[i] = l * dry + wl * mix; oR[i] = r * dry + wr * mix;
         }
         break;
       }
       case 6: {   // PHASER: rate, depth, feedback (6 allpass stages)
         const inc = rate / sr, fb = c * 0.8;
         for (let i = 0; i < n; i++) {
+          const l = L[i], r = R[i];
           if ((this.ph += inc) >= 1) this.ph -= 1;
           const tl = Math.tan(Math.PI * 300 * Math.pow(12, (0.5 + 0.5 * Math.sin(this.ph * 6.2832)) * b) / sr), cl = (tl - 1) / (tl + 1);
           const tr = Math.tan(Math.PI * 300 * Math.pow(12, (0.5 + 0.5 * Math.cos(this.ph * 6.2832)) * b) / sr), cr = (tr - 1) / (tr + 1);
-          let xl = L[i] + this.fbL * fb, xr = R[i] + this.fbR * fb;
+          let xl = l + this.fbL * fb, xr = r + this.fbR * fb;
           for (let s = 0; s < 6; s++) {
             const yl = cl * xl + this.apL[s]; this.apL[s] = xl - cl * yl; xl = yl;
             const yr = cr * xr + this.apR[s]; this.apR[s] = xr - cr * yr; xr = yr;
           }
           this.fbL = xl; this.fbR = xr;
-          oL[i] = L[i] * dry + (L[i] + xl) * 0.5 * mix; oR[i] = R[i] * dry + (R[i] + xr) * 0.5 * mix;
+          oL[i] = l * dry + (l + xl) * 0.5 * mix; oR[i] = r * dry + (r + xr) * 0.5 * mix;
         }
         break;
       }
       case 7: case 8: {   // TREMOLO / AUTOPAN: rate, depth, shape
         const inc = rate / sr, pan = type === 8;
         for (let i = 0; i < n; i++) {
+          const l = L[i], r = R[i];
           if ((this.ph += inc) >= 1) this.ph -= 1;
-          const s = this.lfo(c);
-          const gl = pan ? 1 - b * (0.5 + 0.5 * s) : 1 - b * (0.5 + 0.5 * s), gr = pan ? 1 - b * (0.5 - 0.5 * s) : gl;
-          oL[i] = L[i] * dry + L[i] * gl * mix; oR[i] = R[i] * dry + R[i] * gr * mix;
+          const s = this.lfo(c), gl = 1 - b * (0.5 + 0.5 * s), gr = pan ? 1 - b * (0.5 - 0.5 * s) : gl;
+          oL[i] = l * dry + l * gl * mix; oR[i] = r * dry + r * gr * mix;
         }
         break;
       }
       case 9: {   // RINGMOD: frequency, carrier shape
         const inc = 20 * Math.pow(100, a) / sr;
         for (let i = 0; i < n; i++) {
+          const l = L[i], r = R[i];
           if ((this.ph += inc) >= 1) this.ph -= 1;
           const s = this.lfo(b);
-          oL[i] = L[i] * dry + L[i] * s * mix; oR[i] = R[i] * dry + R[i] * s * mix;
+          oL[i] = l * dry + l * s * mix; oR[i] = r * dry + r * s * mix;
         }
         break;
       }
-      default: oL.set(L); oR.set(R);
+      case 10: {   // DELAY: time 10ms-1.5s, feedback, tone (damping in the feedback loop)
+        const N = this.bl.length, dt = Math.min(N - 2, 0.01 * Math.pow(150, a) * sr), fb = b * 0.95;
+        const k = 1 - Math.exp(-2 * Math.PI * Math.min(sr * 0.45, 500 * Math.pow(32, c)) / sr);
+        for (let i = 0; i < n; i++) {
+          const l = L[i], r = R[i], wl = rdN(this.bl, this.w - dt), wr = rdN(this.br, this.w - dt);
+          this.lpL += (wl - this.lpL) * k; this.lpR += (wr - this.lpR) * k;
+          this.bl[this.w] = l + this.lpL * fb; this.br[this.w] = r + this.lpR * fb;
+          if (++this.w >= N) this.w = 0;
+          oL[i] = l * dry + wl * mix; oR[i] = r * dry + wr * mix;
+        }
+        break;
+      }
+      case 11: {   // REVERB: size, damping, width
+        const fb = 0.7 + a * 0.28, damp = b * 0.7, w1 = 0.5 + c * 0.5, w2 = (1 - c) * 0.5;
+        const comb = (cb, x) => { const o = cb.b[cb.i]; cb.f = o * (1 - damp) + cb.f * damp; cb.b[cb.i] = x + cb.f * fb; if (++cb.i >= cb.b.length) cb.i = 0; return o; };
+        const ap = (q, x) => { const bo = q.b[q.i]; q.b[q.i] = x + bo * 0.5; if (++q.i >= q.b.length) q.i = 0; return bo - x; };
+        for (let i = 0; i < n; i++) {
+          const l = L[i], r = R[i], x = (l + r) * 0.015;
+          let yl = 0, yr = 0;
+          for (let k = 0; k < 4; k++) { yl += comb(this.cl[k], x); yr += comb(this.cr[k], x); }
+          for (let k = 0; k < 2; k++) { yl = ap(this.al[k], yl); yr = ap(this.ar[k], yr); }
+          oL[i] = l * dry + (yl * w1 + yr * w2) * 3 * mix; oR[i] = r * dry + (yr * w1 + yl * w2) * 3 * mix;
+        }
+        break;
+      }
+      case 12: {   // WAVEFOLD: fold amount, symmetry, tone
+        const g = 1 + a * 12, off = (b - 0.5) * 0.8, k = 0.05 + 0.95 * c * c;
+        for (let i = 0; i < n; i++) {
+          const l = L[i], r = R[i];
+          let yl = Math.sin((l + off) * g), yr = Math.sin((r + off) * g);
+          this.dcL += (yl - this.dcL) * 0.001; this.dcR += (yr - this.dcR) * 0.001; yl -= this.dcL; yr -= this.dcR;
+          this.lpL += (yl - this.lpL) * k; this.lpR += (yr - this.lpR) * k;
+          oL[i] = l * dry + this.lpL * mix; oR[i] = r * dry + this.lpR * mix;
+        }
+        break;
+      }
+      case 13: {   // TAPE: saturation, wow & flutter, tone
+        const g = 1 + a * 6, comp = 1 / Math.sqrt(g), base = 0.006 * sr, dep = b * 0.003 * sr;
+        const k = 1 - Math.exp(-2 * Math.PI * Math.min(sr * 0.45, 2000 * Math.pow(9, c)) / sr), i1 = 0.6 / sr, i2 = 7 / sr;
+        for (let i = 0; i < n; i++) {
+          const l = L[i], r = R[i];
+          this.bl[this.w] = l; this.br[this.w] = r;
+          if ((this.ph += i1) >= 1) this.ph -= 1;
+          if ((this.ph2 += i2) >= 1) this.ph2 -= 1;
+          const d = base + dep * (0.7 * Math.sin(this.ph * 6.2832) + 0.3 * Math.sin(this.ph2 * 6.2832));
+          let yl = Math.tanh(rd8(this.bl, this.w - d) * g) * comp, yr = Math.tanh(rd8(this.br, this.w - d) * g) * comp;
+          this.w = (this.w + 1) & 8191;
+          this.lpL += (yl - this.lpL) * k; this.lpR += (yr - this.lpR) * k;
+          oL[i] = l * dry + this.lpL * mix; oR[i] = r * dry + this.lpR * mix;
+        }
+        break;
+      }
+      case 14: {   // COMB (resonator): pitch 40Hz-2kHz, feedback, damping
+        const dt = Math.min(8190, sr / (40 * Math.pow(50, a))), fb = b * 0.97, damp = c * 0.8;
+        for (let i = 0; i < n; i++) {
+          const l = L[i], r = R[i], wl = rd8(this.bl, this.w - dt), wr = rd8(this.br, this.w - dt);
+          this.lpL = wl * (1 - damp) + this.lpL * damp; this.lpR = wr * (1 - damp) + this.lpR * damp;
+          this.bl[this.w] = l + this.lpL * fb; this.br[this.w] = r + this.lpR * fb; this.w = (this.w + 1) & 8191;
+          oL[i] = l * dry + wl * 0.7 * mix; oR[i] = r * dry + wr * 0.7 * mix;
+        }
+        break;
+      }
+      case 15: {   // FORMANT (vowel filter): vowel A-E-I-O-U, resonance, formant shift
+        const pos = a * 4, v0 = Math.min(3, Math.floor(pos)), fr = pos - v0, sc = 0.7 * Math.pow(2, c), res = 0.5 + b * 0.45, gains = [1, 0.6, 0.35];
+        for (let k = 0; k < 3; k++) {
+          const fq = Math.min(sr * 0.45, (VOWELS[v0][k] + (VOWELS[v0 + 1][k] - VOWELS[v0][k]) * fr) * sc);
+          this.fm[k].setup(fq, res); this.fm[k + 3].copy(this.fm[k]);
+        }
+        for (let i = 0; i < n; i++) {
+          const l = L[i], r = R[i];
+          let yl = 0, yr = 0;
+          for (let k = 0; k < 3; k++) { yl += this.fm[k].tick(l, 2) * gains[k]; yr += this.fm[k + 3].tick(r, 2) * gains[k]; }
+          oL[i] = l * dry + yl * 1.5 * mix; oR[i] = r * dry + yr * 1.5 * mix;
+        }
+        break;
+      }
+      case 16: {   // FREQ SHIFT: shift (-1.5k..+1.5kHz), feedback, stereo spread (right shifts the other way)
+        const x = a * 2 - 1, hz = 1500 * x * x * x, hzR = hz * (1 - 2 * c), fb = b * 0.7, H = this.hs;
+        for (let i = 0; i < n; i++) {
+          const l = L[i], r = R[i];
+          if ((this.ph += hz / sr) >= 1) this.ph -= 1; else if (this.ph < 0) this.ph += 1;
+          if ((this.ph2 += hzR / sr) >= 1) this.ph2 -= 1; else if (this.ph2 < 0) this.ph2 += 1;
+          const inL = l + this.fbv[0] * fb, inR = r + this.fbv[1] * fb;
+          const IL = this.dI[0], QL = hilb(H[1], HILB_B, inL); this.dI[0] = hilb(H[0], HILB_A, inL);
+          const IR = this.dI[1], QR = hilb(H[3], HILB_B, inR); this.dI[1] = hilb(H[2], HILB_A, inR);
+          const a1 = this.ph * 6.283185307179586, a2 = this.ph2 * 6.283185307179586;
+          const yl = IL * Math.cos(a1) - QL * Math.sin(a1), yr = IR * Math.cos(a2) - QR * Math.sin(a2);
+          this.fbv[0] = yl; this.fbv[1] = yr;
+          oL[i] = l * dry + yl * mix; oR[i] = r * dry + yr * mix;
+        }
+        break;
+      }
+      case 17: {   // GATE (trance gate): rate 1-16Hz, depth, duty
+        const inc = Math.pow(16, a) / sr, duty = 0.1 + c * 0.8, low = 1 - b, sm = 1 - Math.exp(-1 / (0.003 * sr));
+        for (let i = 0; i < n; i++) {
+          const l = L[i], r = R[i];
+          if ((this.ph += inc) >= 1) this.ph -= 1;
+          this.gate += ((this.ph < duty ? 1 : low) - this.gate) * sm;
+          oL[i] = l * dry + l * this.gate * mix; oR[i] = r * dry + r * this.gate * mix;
+        }
+        break;
+      }
+      case 18: {   // WIDENER: width 0-200%, haas delay 0-25ms, bass mono (keeps lows centered)
+        const wd = a * 2, haas = b * 0.025 * sr, k = 1 - Math.exp(-2 * Math.PI * 150 / sr);
+        for (let i = 0; i < n; i++) {
+          const l = L[i], r = R[i];
+          this.br[this.w] = r;
+          const rr = haas > 0.5 ? rd8(this.br, this.w - haas) : r;
+          this.w = (this.w + 1) & 8191;
+          const mid = (l + rr) * 0.5;
+          let side = (l - rr) * 0.5;
+          this.slp += (side - this.slp) * k;
+          side = (side - this.slp * c) * wd;
+          oL[i] = l * dry + (mid + side) * mix; oR[i] = r * dry + (mid - side) * mix;
+        }
+        break;
+      }
+      case 19: {   // ENV FILTER (auto-wah): sensitivity, resonance, base frequency
+        const base = 150 * Math.pow(10, c), att = Math.exp(-1 / (0.002 * sr)), rel = Math.exp(-1 / (0.12 * sr)), res = b * 0.9;
+        for (let i = 0; i < n; i++) {
+          const l = L[i], r = R[i], pk = Math.abs(l + r) * 0.5;
+          this.env = pk > this.env ? att * this.env + (1 - att) * pk : rel * this.env + (1 - rel) * pk;
+          if (this.cnt-- <= 0) {
+            this.cnt = 15;
+            this.fL.setup(Math.min(sr * 0.45, base * Math.pow(2, Math.min(1, this.env * 3) * a * 6)), res); this.fR.copy(this.fL);
+          }
+          oL[i] = l * dry + this.fL.tick(l, 2) * 1.5 * mix; oR[i] = r * dry + this.fR.tick(r, 2) * 1.5 * mix;
+        }
+        break;
+      }
+      case 20: {   // COMP: threshold 0..-40dB, ratio 1..20, makeup 0..24dB
+        const thr = Math.pow(10, -a * 40 / 20), ratio = 1 + b * 19, mk = Math.pow(10, c * 24 / 20);
+        const att = Math.exp(-1 / (0.003 * sr)), rel = Math.exp(-1 / (0.12 * sr));
+        for (let i = 0; i < n; i++) {
+          const l = L[i], r = R[i], pk = Math.max(Math.abs(l), Math.abs(r));
+          this.env = pk > this.env ? att * this.env + (1 - att) * pk : rel * this.env + (1 - rel) * pk;
+          const gr = this.env > thr ? Math.pow(this.env / thr, 1 / ratio - 1) : 1, g = gr * mk;
+          oL[i] = l * dry + l * g * mix; oR[i] = r * dry + r * g * mix;
+        }
+        break;
+      }
+      default: if (oL !== L) { oL.set(L); oR.set(R); }
     }
+  }
+}
+
+// Per-track insert effect. All controls are normalized 0..1 k-rate AudioParams so they can be
+// automated sample-accurately from the main thread (setValueAtTime / setTargetAtTime).
+class InsertFX extends AudioWorkletProcessor {
+  static get parameterDescriptors() {
+    return ['type', 'a', 'b', 'c', 'mix'].map(name => ({ name, defaultValue: name === 'type' ? 0 : name === 'mix' ? 1 : 0.5, minValue: 0, maxValue: name === 'type' ? 20 : 1, automationRate: 'k-rate' }));
+  }
+  constructor() { super(); this.fx = new FxUnit(); }
+  process(inputs, outputs, P) {
+    const out = outputs[0], oL = out[0], oR = out[1] || out[0], n = oL.length, inp = inputs[0];
+    if (!inp || !inp.length) { oL.fill(0); oR.fill(0); return true; }
+    const L = inp[0], R = inp[1] || inp[0], type = Math.round(P.type[0]), mix = P.mix[0];
+    if (type === 0 || mix <= 0) { oL.set(L); oR.set(R); return true; }
+    this.fx.setType(type);
+    this.fx.process(L, R, oL, oR, n, P.a[0], P.b[0], P.c[0], mix);
     return true;
   }
 }
-function rd8(b, pos) { if (pos < 0) pos += 8192; const i = pos | 0, f = pos - i; return b[i & 8191] * (1 - f) + b[(i + 1) & 8191] * f; }
 registerProcessor('insert-fx', InsertFX);
 
 // Microphone recorder: collects mono input and posts chunks to the main thread
@@ -1183,7 +1384,7 @@ onmessage = e => {
 // =====================================================================
 // 1. CONSTANTS & UTILS
 // =====================================================================
-const TRACKS = 8, FIELDS = 8, NOTE_OFF = 120, NOTE_CUT = 121, MAX_INST = 64, MAX_PATTERNS = 128, MAX_ORDER = 256;
+const TRACKS = 8, FIELDS = 11, NOTE_OFF = 120, NOTE_CUT = 121, MAX_INST = 64, MAX_PATTERNS = 128, MAX_ORDER = 256;
 const PREVIEW_CH0 = TRACKS, PREVIEW_CHS = 4;
 const NOTE_NAMES = ['C-', 'C#', 'D-', 'D#', 'E-', 'F-', 'F#', 'G-', 'G#', 'A-', 'A#', 'B-'];
 const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
@@ -1419,6 +1620,8 @@ const INSTRUMENT_TYPES = {
   lead: { label: 'LEAD', pages: LEAD_PAGES, presets: LEAD_PRESETS,
     fix: p => { p.ampA = Math.min(p.ampA, 0.08); p.cutoff = Math.max(p.cutoff, 600); p.ampS = Math.max(p.ampS, 0.3); } },
 };
+// every instrument type gets the FX page (two effect slots, see instFxParams)
+for (const k in INSTRUMENT_TYPES) INSTRUMENT_TYPES[k].pages.push({ name: 'FX', custom: 'fx' });
 const KEEP_ON_RANDOM = new Set(['vol', 'pan', 'poly']);
 function randomizeParams(ins) {
   const T = INSTRUMENT_TYPES[ins.type];
@@ -1454,7 +1657,27 @@ const FX_TYPES = [
   { name: 'CHORUS', p: MOD3 }, { name: 'FLANGER', p: MOD3 }, { name: 'PHASER', p: MOD3 },
   { name: 'TREMOLO', p: TREM3 }, { name: 'AUTOPAN', p: TREM3 },
   { name: 'RINGMOD', p: [['FREQ', v => hzf(20 * Math.pow(100, v))], ['SHAPE', pct]] },
+  { name: 'DELAY', p: [['TIME', v => { const s = 0.01 * Math.pow(150, v); return s < 1 ? Math.round(s * 1000) + 'ms' : s.toFixed(2) + 's'; }], ['FDBK', pct], ['TONE', v => hzf(500 * Math.pow(32, v))]] },
+  { name: 'REVERB', p: [['SIZE', pct], ['DAMP', pct], ['WIDTH', pct]] },
+  { name: 'WAVEFOLD', p: [['FOLD', pct], ['SYMM', v => Math.round((v - 0.5) * 200) + '%'], ['TONE', pct]] },
+  { name: 'TAPE', p: [['SATUR', pct], ['WOW', pct], ['TONE', v => hzf(2000 * Math.pow(9, v))]] },
+  { name: 'COMB', p: [['PITCH', v => hzf(40 * Math.pow(50, v))], ['FDBK', pct], ['DAMP', pct]] },
+  { name: 'FORMANT', p: [['VOWEL', v => 'AEIOU'[Math.min(4, Math.round(v * 4))]], ['RESO', pct], ['SHIFT', v => 'x' + (0.7 * Math.pow(2, v)).toFixed(2)]] },
+  { name: 'FREQSHIFT', p: [['SHIFT', v => { const x = v * 2 - 1, h = 1500 * x * x * x; return (h > 0 ? '+' : '') + (Math.abs(h) < 10 ? h.toFixed(1) : Math.round(h)) + 'Hz'; }], ['FDBK', pct], ['SPREAD', pct]] },
+  { name: 'GATE', p: [['RATE', v => hzf(Math.pow(16, v))], ['DEPTH', pct], ['DUTY', v => Math.round((0.1 + v * 0.8) * 100) + '%']] },
+  { name: 'WIDENER', p: [['WIDTH', v => Math.round(v * 200) + '%'], ['HAAS', v => (v * 25).toFixed(1) + 'ms'], ['BASSMONO', pct]] },
+  { name: 'ENVFILTER', p: [['SENS', pct], ['RESO', pct], ['BASE', v => hzf(150 * Math.pow(10, v))]] },
+  { name: 'COMP', p: [['THRESH', v => '-' + Math.round(v * 40) + 'dB'], ['RATIO', v => (1 + v * 19).toFixed(1) + ':1'], ['MAKEUP', v => '+' + Math.round(v * 24) + 'dB']] },
 ];
+// two FX slots inside every instrument (keys ifx1*/ifx2*), same effect types as the track insert
+const INST_FX_DEFAULTS = { ifx1Type: 0, ifx1A: 0.5, ifx1B: 0.5, ifx1C: 0.5, ifx1Mix: 1, ifx2Type: 0, ifx2A: 0.5, ifx2B: 0.5, ifx2C: 0.5, ifx2Mix: 1 };
+function instFxParams(ins, slot) {
+  const k = 'ifx' + slot, T = FX_TYPES[ins.p[k + 'Type'] | 0] || FX_TYPES[0];
+  const list = [P(k + 'Type', 'FX ' + slot, 0, FX_TYPES.length - 1, 0, { options: FX_TYPES.map(t => t.name) })];
+  T.p.forEach(([label, fn], j) => list.push(P(k + ['A', 'B', 'C'][j], label, 0, 1, 0.5, { fmtFn: fn })));
+  if (T.p.length) list.push(P(k + 'Mix', 'MIX', 0, 1, 1, { fmtFn: pct }));
+  return list;
+}
 const TRACK_FX_DEFAULTS = { fxType: 0, fxA: 0.5, fxB: 0.5, fxC: 0.5, fxMix: 1 };
 function trackFxParams(i) {
   const T = FX_TYPES[song.tracks[i].fxType | 0] || FX_TYPES[0];
@@ -1478,7 +1701,7 @@ function autoResolve(tgt) {
   const [kind, id, key] = tgt.split(':'), idx = +id;
   if (kind === 'i') {
     const ins = song.instruments[idx]; if (!ins) return null;
-    const pd = findPd(INSTRUMENT_TYPES[ins.type].pages, key);
+    const pd = findPd(INSTRUMENT_TYPES[ins.type].pages, key) || (key.startsWith('ifx') ? findPd(instFxParams(ins, 1).concat(instFxParams(ins, 2)), key) : null);
     return pd && pd.max !== 'len' ? { kind, idx, key, pd, obj: ins.p, ins, label: hex(idx) + ' ' + (ins.name || INSTRUMENT_TYPES[ins.type].label) + ' › ' + pd.label } : null;
   }
   if (!AUTO_MIX[kind] || !AUTO_MIX[kind].includes(key)) return null;
@@ -1580,7 +1803,7 @@ function previewKit(t, slot) {
   if (state.inst !== id) { state.inst = id; engine.watch(id); ui.sideInst.textContent = hex(id) + ' ' + (I.name || '--'); waveView.fit(); }
 }
 function defaultParams(type) {
-  const T = INSTRUMENT_TYPES[type], p = Object.assign({}, T.extra);
+  const T = INSTRUMENT_TYPES[type], p = Object.assign({}, INST_FX_DEFAULTS, T.extra);
   for (const pg of T.pages) for (const d of pg.params || []) p[d.key] = d.max === 'len' ? 0 : d.def;
   return p;
 }
@@ -1594,7 +1817,7 @@ class Song {
     this.instruments = [null];
     for (let i = 1; i <= MAX_INST; i++) this.instruments.push(new Instrument());
     // kind: 'synth' (normal track, INS = instrument) or 'sample' (INS = slot in this track's kit of sampler instruments)
-    this.tracks = Array.from({ length: TRACKS }, (_, i) => Object.assign({ name: 'TRK' + (i + 1), auto: '', kind: 'synth', kit: [] }, defaultsOf(TRACK_PARAMS), TRACK_FX_DEFAULTS));
+    this.tracks = Array.from({ length: TRACKS }, (_, i) => Object.assign({ name: 'TRK' + (i + 1), auto: '', auto2: '', auto3: '', auto4: '', kind: 'synth', kit: [] }, defaultsOf(TRACK_PARAMS), TRACK_FX_DEFAULTS));
     this.master = defaultsOf(MASTER_PARAMS);
     this.fx = Object.assign(defaultsOf(REV_PARAMS), defaultsOf(DLY_PARAMS));
     this.samples = new Map(); this.nextSampleId = 1;
@@ -1630,9 +1853,9 @@ function songFromObj(o) {
   s.patterns = o.patterns.slice(0, MAX_PATTERNS).map(pp => {
     const p = new Pattern(clamp(pp.rows | 0, 16, 256)), d = dec(pp.data, Int16Array), cells = p.rows * TRACKS;
     if (d.length === p.data.length) p.data.set(d);
-    else {   // older files: 5 (v2) or 7 (v3) values per cell; the newer columns stay empty
+    else {   // older files: 5, 7 or 8 values per cell; the newer columns stay empty
       const k = d.length / cells;
-      if (k === 5 || k === 7) for (let c = 0; c < cells; c++) p.data.set(d.subarray(c * k, c * k + k), c * FIELDS);
+      if (k === 5 || k === 7 || k === 8) for (let c = 0; c < cells; c++) p.data.set(d.subarray(c * k, c * k + k), c * FIELDS);
     }
     return p;
   });
@@ -2038,7 +2261,10 @@ class Player {
       c.dly = sw > 0 ? sw / 256 * this.speed * this.tickDur : 0;
       const tt = time + c.dly;
       if (n >= 0 && n < 120) c.gate = len > 0 ? len : 0;
-      if (au >= 0 && this.song.tracks[t].auto) evs.push({ t: tt, k: 'auto', tgt: this.song.tracks[t].auto, v: au });
+      for (let L = 0; L < 4; L++) {   // 4 automation lanes, each with its own target per track
+        const av = L ? d[o + AUTO_COLS[L]] : au, tg = tr[AUTO_KEYS[L]];
+        if (av >= 0 && tg) evs.push({ t: tt, k: 'auto', tgt: tg, v: av });
+      }
       c.fx = fx; c.pa = pa; c.arpOff = 0; c.delayed = null;
       let off = 0;
       if (ins > 0) { c.inst = ins; c.vol = 64; } else if (ins === -2) c.inst = 0;   // -2: empty kit slot = silence
@@ -2209,7 +2435,7 @@ async function requestWakeLock(on) {
 let song = makeDefaultSong();
 const state = {
   tab: 'pattern', order: 0, row: 0, track: 0, field: 0, octave: 4, step: 1, inst: 1,
-  edit: true, follow: true, view: 'full', noteLen: 0, loop: true, metro: false, kitSlot: new Array(TRACKS).fill(1), sel: null, selMode: false,
+  edit: true, follow: true, view: 'full', noteLen: 0, loop: true, metro: false, autoLane: 0, kitSlot: new Array(TRACKS).fill(1), sel: null, selMode: false,
   padShown: { pattern: true, instr: false, mixer: false, rsmp: false, file: false },
   rs: { src: 0, tap: 1, range: 0, tail: 1, norm: 1, warp: 1, loop: 0, dest: 0, last: 0 }, sidePage: 'edit', clip: null, playPos: null,
   mute: new Array(TRACKS).fill(false), solo: new Array(TRACKS).fill(false),
@@ -2296,6 +2522,10 @@ const undo = { snap(pi) { history.push(patEntry(song.patterns[pi])); }, undo() {
 const FIELD_CHARS = [0, 4, 5, 7, 8, 10, 11, 12, 14, 15, 17, 18, 20, 21], FIELD_LEN = [3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1];
 const FIELD_COL = [0, 1, 1, 2, 2, 3, 4, 4, 5, 5, 6, 6, 7, 7];   // field -> cell data column
 const VIEWS = { compact: { fields: 3, chars: 7 }, normal: { fields: 8, chars: 14 }, full: { fields: 14, chars: 23 } };
+// 4 automation lanes per row: the AUTO column shows one of them at a time (AUTO LANE button)
+const AUTO_COLS = [6, 8, 9, 10], AUTO_KEYS = ['auto', 'auto2', 'auto3', 'auto4'];
+const laneCol = () => AUTO_COLS[state.autoLane], laneKey = () => AUTO_KEYS[state.autoLane];
+const fieldCol = f => (f === 10 || f === 11) ? laneCol() : FIELD_COL[f];
 const numFields = () => VIEWS[state.view].fields;
 // which dial the pad shows for the cursor: LEN / AUTO columns, or the sample-slot column on SAMPLE tracks
 const dialKind = (f = state.field) => f >= 12 ? 'swg' : f >= 10 ? 'auto' : f >= 8 ? 'len' : (f === 1 || f === 2) && song.tracks[state.track].kind === 'sample' ? 'smp' : null;
@@ -2348,7 +2578,7 @@ function enterHex(dg) {
       case 5: d[o + 3] = dg; if (d[o + 4] < 0) d[o + 4] = 0; break;
       case 6: case 7: if (d[o + 3] < 0) d[o + 3] = 0; setNib(4, f === 6, 255); break;
       case 8: case 9: setNib(5, f === 8, 255); if (d[o + 5] === 0 && f === 9) d[o + 5] = -1; break;
-      case 10: case 11: setNib(6, f === 10, 255); break;
+      case 10: case 11: setNib(laneCol(), f === 10, 255); break;
       case 12: case 13: setNib(7, f === 12, 255); break;
     }
   });
@@ -2364,7 +2594,7 @@ function clearField() {
     else if (f <= 2) d[o + 1] = -1;
     else if (f <= 4) d[o + 2] = -1;
     else if (f <= 7) { d[o + 3] = -1; d[o + 4] = -1; }
-    else d[o + FIELD_COL[f]] = -1;
+    else d[o + fieldCol(f)] = -1;
   });
   const back = { 2: 1, 4: 3, 6: 5, 7: 5, 9: 8, 11: 10, 13: 12 };
   state.field = back[f] != null ? back[f] : f;
@@ -2401,7 +2631,7 @@ function clearSel() { const r = selRect(true); editPat(p => forRect(r, (row, t) 
 function interpolate() {
   const r = selRect(false);
   if (!r || r.r1 - r.r0 < 2) return toast('Select 3+ rows first (SEL, then drag)');
-  const col = FIELD_COL[state.field];
+  const col = fieldCol(state.field);
   editPat(p => {
     const d = p.data;
     for (let t = r.t0; t <= r.t1; t++) {
@@ -2616,6 +2846,7 @@ function fmtParam(pd, v, ins) {
 function onInstParam(key) {
   engine.markInst(state.inst);
   if (/^(sStart|sEnd|loop|xfade)/.test(key)) waveView.dirty = true;
+  if (/^ifx\dType$/.test(key)) { cancelAnimationFrame(ui.fxRaf); ui.fxRaf = requestAnimationFrame(renderParams); }   // relabel the slot
 }
 // a bind tells a ParamBox where its value lives: instrument params, a mixer track, master or FX
 // target() captures "which object" when an edit starts, so undo still hits it after you switch instrument/track
@@ -2775,13 +3006,18 @@ class PatternView {
       d = { id: e.pointerId, x0: x, y0: y, sy: this.scrollY, sx: this.scrollX, moved: false, h, mode: 'scroll' };
       if (state.selMode && h && h.type === 'cell' && h.row >= 0 && h.row < rows) {
         d.mode = 'sel'; state.sel = { t0: h.track, t1: h.track, r0: h.row, r1: h.row }; this.dirty = true;
+      } else if (h && h.type === 'cell' && h.row >= 0 && h.row < rows) {
+        // hold a note still for 1.5s: show which sample / slice / synth it plays
+        const dd = d;
+        dd.lp = setTimeout(() => { if (d === dd && !dd.moved) dd.lpShown = showNoteInfo(h.track, h.row); }, 1500);
       }
     });
+    cv.addEventListener('contextmenu', e => e.preventDefault());
     cv.addEventListener('pointermove', e => {
       if (!d || e.pointerId !== d.id) return;
       const [x, y] = pos(e), dx = x - d.x0, dy = y - d.y0;
       if (!d.moved && Math.hypot(dx, dy) < 7) return;
-      d.moved = true;
+      d.moved = true; clearTimeout(d.lp);
       if (d.mode === 'sel') {
         const h = this.hit(clamp(x, this.numW + 1, this.w - 1), clamp(y, this.headH + 1, this.h - 1));
         if (h && h.type === 'cell') { state.sel.t1 = h.track; state.sel.r1 = clamp(h.row, 0, curPat().rows - 1); this.dirty = true; }
@@ -2792,6 +3028,8 @@ class PatternView {
     });
     const up = e => {
       if (!d || e.pointerId !== d.id) return;
+      clearTimeout(d.lp);
+      if (d.lpShown) hideNoteInfo(false);   // fades 1s after release
       const h = d.h, rows = curPat().rows;
       if (!d.moved && h) {
         if (h.type === 'head') {
@@ -2868,13 +3106,13 @@ class PatternView {
       if (tc) { g.globalAlpha = state.mute[t] ? 0.3 : sel ? 1 : 0.72; g.fillStyle = tc; g.fillRect(x, 0, tw - 1, 25); g.globalAlpha = 1; }
       g.fillStyle = tc ? C.trackTxt : sel ? C.hdrSelTxt : C.hdrTxt; g.font = 'bold 12px ' + uiFont();
       g.fillText(String(t + 1), x + 6, 12);
-      const ar = song.tracks[t].auto && autoResolve(song.tracks[t].auto), smpT = song.tracks[t].kind === 'sample';
+      const ar = song.tracks[t][laneKey()] && autoResolve(song.tracks[t][laneKey()]), smpT = song.tracks[t].kind === 'sample';
       g.font = 'bold 10px ' + uiFont();
       if (smpT) { g.fillStyle = tc ? C.trackTxt : C.smp; g.fillText('SMP', x + 22, 12); }
       if (ar && tw > 110) {
         const ax = x + (smpT ? 48 : 22), room = tw - 62 - (ax - x);
         g.fillStyle = tc ? C.trackTxt : C.auto;
-        let s = 'A:' + ar.pd.label;
+        let s = 'A' + (state.autoLane ? state.autoLane + 1 : '') + ':' + ar.pd.label;
         while (s.length > 3 && g.measureText(s).width > room) s = s.slice(0, -1);
         if (room > 16) g.fillText(s, ax, 12);
       }
@@ -2906,11 +3144,80 @@ class PatternView {
     if (f < 0) { g.fillStyle = C.empty; g.fillText('...', x + cw * 10, y); }
     else { g.fillStyle = C.fx; g.fillText(hex(f, 1), x + cw * 10, y); g.fillStyle = C.par; g.fillText(hex(Math.max(0, pa)), x + cw * 11, y); }
     if (state.view !== 'full') return;
-    const ln = d[o + 5], au = d[o + 6], sw = d[o + 7];
+    const ln = d[o + 5], au = d[o + laneCol()], sw = d[o + 7];
     g.fillStyle = ln < 0 ? C.empty : C.len; g.fillText(ln < 0 ? '..' : hex(ln), x + cw * 14, y);
     g.fillStyle = au < 0 ? C.empty : C.auto; g.fillText(au < 0 ? '..' : hex(au), x + cw * 17, y);
     g.fillStyle = sw < 0 ? C.empty : C.swg; g.fillText(sw < 0 ? '..' : hex(sw), x + cw * 20, y);
   }
+}
+
+// ---- note info box (hold a note 1.5s) ----
+// Which instrument / sample / slice a pattern note really plays, following tracker rules:
+// a row without INS uses the last instrument above it on the track; SAMPLE tracks map INS through the kit.
+function noteInfo(t, row) {
+  const p = curPat(), d = p.data, o = p.i(row, t), tr = song.tracks[t], smpT = tr.kind === 'sample';
+  let n = d[o], ins = d[o + 1];
+  if ((n < 0 || n >= 120) && !(smpT && ins > 0)) return null;
+  let r = row;
+  while (ins < 0 && r > 0) { r--; ins = d[p.i(r, t) + 1]; }
+  const id = smpT ? (ins > 0 ? tr.kit[ins - 1] | 0 : 0) : Math.max(0, ins), I = id ? song.instruments[id] : null;
+  if (n < 0 || n >= 120) n = I && I.p.root != null ? I.p.root : 48;   // slot-only row: natural pitch
+  const out = { note: noteName(n), id, ins: I, slot: smpT && ins > 0 ? ins : 0 };
+  if (I && I.type === 'sampler') {
+    const s = instSample(I);
+    if (s) {
+      out.s = s; out.a = I.p.sStart; out.b = I.p.sEnd || s.len;
+      if (I.p.sliceMode && I.slices.length) {
+        const k = n - I.p.root;
+        if (k >= 0 && k < I.slices.length) { out.a = I.slices[k]; out.b = k + 1 < I.slices.length ? I.slices[k + 1] : out.b; out.slice = k + 1; out.slices = I.slices.length; }
+        else out.noSlice = true;
+      }
+    }
+  }
+  return out;
+}
+function drawRegion(cv, s, a, b) {
+  const g = cv.getContext('2d'), W = cv.width, H = cv.height, d = s.ch[0], pk = s.peaks[0], mid = H / 2, spp = Math.max(1e-9, (b - a) / W);
+  g.fillStyle = C.waveBg; g.fillRect(0, 0, W, H);
+  g.fillStyle = C.wave;
+  for (let x = 0; x < W; x++) {
+    const f0 = a + x * spp, f1 = f0 + spp;
+    let lo = 1, hi = -1;
+    if (spp > 256) { for (let k = Math.floor(f0 / 256); k < Math.min(pk.mn.length, Math.ceil(f1 / 256)); k++) { lo = Math.min(lo, pk.mn[k]); hi = Math.max(hi, pk.mx[k]); } }
+    else for (let i = Math.floor(f0); i < Math.min(d.length, Math.max(Math.floor(f0) + 1, Math.ceil(f1))); i++) { lo = Math.min(lo, d[i]); hi = Math.max(hi, d[i]); }
+    if (hi >= lo) g.fillRect(x, mid - hi * mid * 0.92, 1, Math.max(1, (hi - lo) * mid * 0.92));
+  }
+}
+function showNoteInfo(t, row) {
+  const info = noteInfo(t, row);
+  if (!info) return false;
+  hideNoteInfo(true);
+  const I = info.ins, box = el('div', { class: 'noteinfo', id: 'noteinfo' });
+  box.append(el('b', { text: info.note + '   ' + (I ? hex(info.id) + ' ' + (I.name || INSTRUMENT_TYPES[I.type].label) : 'no instrument') }));
+  let line = info.slot ? 'KIT SLOT ' + hex(info.slot) + '   ' : '';
+  if (I && I.type !== 'sampler') line += INSTRUMENT_TYPES[I.type].label + ' SYNTH' + (I.preset ? ' · ' + I.preset : '');
+  else if (info.s) {
+    line += info.slice ? 'SLICE ' + info.slice + ' / ' + info.slices : info.noSlice ? 'no slice on this key' : 'SAMPLE ' + (info.s.name || '');
+    if (!info.noSlice) line += '   ' + (info.a / info.s.sr).toFixed(3) + '–' + (info.b / info.s.sr).toFixed(3) + ' s';
+    const w = I.p.warp | 0;
+    if (w) line += '   ' + ['', 'WARP', 'MPC', 'RE-PITCH'][w];
+  } else if (I) line += 'empty instrument (no sample)';
+  box.append(el('span', { text: line }));
+  if (info.s && !info.noSlice) { const cv = el('canvas', { width: 440, height: 90 }); drawRegion(cv, info.s, info.a, info.b); box.append(cv); }
+  const wrap = $('#pat-wrap');
+  wrap.append(box);
+  const pv = patView, x = pv.numW + t * pv.trackW - pv.scrollX, y = pv.headH + (row - pv.scrollY) * pv.rowH, bw = box.offsetWidth, bh = box.offsetHeight;
+  box.style.left = clamp(x, 2, Math.max(2, wrap.clientWidth - bw - 2)) + 'px';
+  box.style.top = (y - bh - 6 >= 0 ? y - bh - 6 : Math.min(y + pv.rowH + 6, wrap.clientHeight - bh - 2)) + 'px';
+  requestAnimationFrame(() => box.classList.add('show'));
+  return true;
+}
+function hideNoteInfo(now) {
+  const b = $('#noteinfo');
+  clearTimeout(ui.niT);
+  if (!b) return;
+  if (now) { b.remove(); return; }
+  ui.niT = setTimeout(() => { b.classList.remove('show'); setTimeout(() => b.remove(), 400); }, 1000);
 }
 
 // =====================================================================
@@ -3716,9 +4023,16 @@ function renderSide() {
       btn('-12', () => transpose(-12)), btn('+12', () => transpose(12)), btn('PANIC', () => { stop(); engine.panic(); }, 'red'),
       btn('INS ROW', () => insRow(false)), btn('DEL ROW', () => insRow(true)), ui.followBtn,
       ui.compactBtn,
+      // which of the 4 automation lanes the AUTO column shows (tap to switch 1 -> 2 -> 3 -> 4)
+      ui.laneBtn = btn('AUTO 1/4', () => {
+        state.autoLane = (state.autoLane + 1) % 4;
+        if (state.view !== 'full') { state.view = 'full'; patView.clampScroll(); }
+        refreshSideToggles(); refreshDial(); patView.dirty = true;
+        toast('AUTO column shows lane ' + (state.autoLane + 1) + ' of 4', 1200);
+      }, 'lane'),
       ui.kindBtn = btn('SYNTH', () => toggleTrackKind(state.track)),
     );
-    ui.kindBtn.classList.add('span2');
+    ui.laneBtn.classList.add('span2'); ui.kindBtn.classList.add('span3');
     refreshSideToggles();
   } else {
     c.append(btn('PAT-', () => orderOps.pat(-1)), btn('PAT+', () => orderOps.pat(1)), btn('NEW', () => orderOps.add(), 'amber'),
@@ -3736,6 +4050,8 @@ function refreshSideToggles() {
   ui.selBtn.classList.toggle('on', state.selMode); ui.followBtn.classList.toggle('on', state.follow); ui.compactBtn.textContent = state.view.toUpperCase();
   const smp = isSmpTrack(state.track);   // track type of the cursor track: tap to switch
   ui.kindBtn.textContent = 'TRK ' + (state.track + 1) + ': ' + (smp ? 'SAMPLE' : 'SYNTH'); ui.kindBtn.classList.toggle('smp', smp);
+  const lr = autoResolve(song.tracks[state.track][laneKey()]);
+  ui.laneBtn.textContent = 'AUTO ' + (state.autoLane + 1) + '/4' + (lr ? ' · ' + lr.pd.label : '');
 }
 function renderOrderList() {
   if (state.sidePage !== 'order' || !ui.olist) return;
@@ -3819,8 +4135,8 @@ function buildPad() {
 // ---- dial pad: LEN (note length in rows) and AUTO (automation value 00-FF) columns ----
 const dial = { held: false, lastRow: -1, val: -1 };
 function dialInfo() {
-  const kind = dialKind(), auto = kind === 'auto', smp = kind === 'smp', swg = kind === 'swg', col = { len: 5, auto: 6, smp: 1, swg: 7 }[kind] || 5, p = curPat(), row = liveRow();
-  return { kind, auto, smp, swg, col, row, raw: p.data[p.i(row, state.track) + col], r: auto ? autoResolve(song.tracks[state.track].auto) : null,
+  const kind = dialKind(), auto = kind === 'auto', smp = kind === 'smp', swg = kind === 'swg', col = { len: 5, auto: laneCol(), smp: 1, swg: 7 }[kind] || 5, p = curPat(), row = liveRow();
+  return { kind, auto, smp, swg, col, row, raw: p.data[p.i(row, state.track) + col], r: auto ? autoResolve(song.tracks[state.track][laneKey()]) : null,
     min: auto ? 0 : 1, max: auto || swg ? 255 : smp ? Math.max(1, song.tracks[state.track].kit.length) : Math.min(255, p.rows) };
 }
 function dialWrite(raw, audition) {
@@ -3850,8 +4166,9 @@ function buildDial() {
   ui.dTarget = el('select', { id: 'auto-target', class: 'tsel' });
   ui.dTarget.addEventListener('change', () => {
     const t = song.tracks[state.track];
-    history.push(paramEntry({ obj: t, apply() { } }, 'auto', t.auto, 'automation target'));
-    t.auto = ui.dTarget.value; markDirty(); refreshDial(); patView.dirty = true;
+    const key = laneKey();
+    history.push(paramEntry({ obj: t, apply() { } }, key, t[key], 'automation target'));
+    t[key] = ui.dTarget.value; markDirty(); refreshDial(); refreshSideToggles(); patView.dirty = true;
   });
   ui.dSl = el('div', { class: 'dsl' }, el('div', { class: 'trk' }, ui.dFill = el('i')), ui.dThumb = el('b'));
   // first touch snapshots undo; holding the slider during playback records into every row the playhead passes
@@ -3895,8 +4212,8 @@ function fillKitAdd() {
   sel.append(g); sel.value = '';
 }
 function fillTargets() {
-  const cur = song.tracks[state.track].auto, sel = ui.dTarget;
-  const key = [state.inst, state.track, cur, song.tracks[state.track].fxType, curInst().type, curInst().name].join('|');
+  const cur = song.tracks[state.track][laneKey()], sel = ui.dTarget;
+  const key = [state.inst, state.track, state.autoLane, cur, song.tracks[state.track].fxType, curInst().type, curInst().name, curInst().p.ifx1Type, curInst().p.ifx2Type].join('|');
   if (sel.dataset.key === key) { sel.value = cur; return; }
   sel.dataset.key = key; sel.innerHTML = '';
   sel.append(el('option', { value: '', text: '— choose target —' }));
@@ -3906,6 +4223,7 @@ function fillTargets() {
   for (const id of ids) {
     const ins = song.instruments[id], items = [];
     for (const pg of INSTRUMENT_TYPES[ins.type].pages) for (const pd of pg.params || []) if (pd.max !== 'len') items.push(['i:' + id + ':' + pd.key, pg.name + ' ' + pd.label]);
+    for (const slot of [1, 2]) for (const pd of instFxParams(ins, slot).slice(1)) items.push(['i:' + id + ':' + pd.key, 'FX' + slot + ' ' + FX_TYPES[ins.p['ifx' + slot + 'Type'] | 0].name + ' ' + pd.label]);
     group('INST ' + hex(id) + ' ' + (ins.name || INSTRUMENT_TYPES[ins.type].label), items);
   }
   const tr = state.track;
@@ -3917,7 +4235,7 @@ function fillTargets() {
 function refreshDial() {
   if (!ui.dTitle || state.tab !== 'pattern' || !isDialField(state.field)) return;
   const di = dialInfo();
-  ui.dTitle.textContent = di.auto ? 'AUTO' : di.smp ? 'SAMPLE' : di.swg ? 'SWING' : 'LEN';
+  ui.dTitle.textContent = di.auto ? 'AUTO ' + (state.autoLane + 1) : di.smp ? 'SAMPLE' : di.swg ? 'SWING' : 'LEN';
   ui.dialWrap.classList.toggle('smpmode', di.smp);
   ui.dialWrap.classList.toggle('swgmode', di.swg);
   ui.dTarget.hidden = !di.auto; ui.dKitAdd.hidden = !di.smp; ui.dKitDel.hidden = !di.smp;
@@ -4049,6 +4367,13 @@ function renderParams() {
   state.instPage = Math.min(state.instPage, T.pages.length - 1); sel.value = state.instPage;
   const box = $('#params'); box.innerHTML = ''; paramBoxes = [];
   const pg = T.pages[state.instPage];
+  if (pg.custom === 'fx') {   // two effect slots; the controls change with the chosen effect type
+    for (const slot of [1, 2]) {
+      box.append(el('div', { class: 'btn fxlbl', text: 'SLOT ' + slot }));
+      for (const pd of instFxParams(ins, slot)) { const pb = new ParamBox(pd); paramBoxes.push(pb); box.append(pb.el); }
+    }
+    return;
+  }
   if (pg.custom === 'slice') {
     box.append(
       new NumBox('SLICES', () => state.sliceN, v => state.sliceN = v, { min: 2, max: 64, px: 8 }).el, btn('EQUAL', () => SliceOps.equal(), 'amber'),
@@ -4459,6 +4784,9 @@ $('#helptext').innerHTML = `<b>MOBTRACK — quick reference</b>   (tap anywhere 
  AUTO = automation value 00-FF for the track's target. On the LEN/AUTO columns the pad becomes a dial:
         drag the big slider to write the value on this row (you hear it right away); pick the target in the list.
         Hold the slider while playing (EDIT + FOLLOW) to record automation live. SEL + INTERP draws ramps.
+        There are 4 automation lanes per row, each with its own target per track: the AUTO n/4 button in the
+        EDIT tools switches which lane the AUTO column shows (the track type switch is the button below it).
+ HOLD a note (or a sample slot) still for 1.5 s: a box shows which instrument, sample, slice and region it plays.
  Note field → piano pad (edit mode writes note + current instrument).  Other fields → hex pad.
  Hex entry: hi digit → lo digit → next row (by STEP).   OFF (===) = note-off/release, CUT (^^^) = fast cut
  SEL mode: drag to select a block → COPY/CUT/PASTE/CLEAR/transpose/INTERP (interpolates the cursor's column)
@@ -4503,7 +4831,9 @@ $('#helptext').innerHTML = `<b>MOBTRACK — quick reference</b>   (tap anywhere 
  FM: ALGO 1-8, > = modulates, + = mixed. Operator pages OP1-OP4 (ratio, level, envelope, velocity).
 
 <b>MIXER</b>  per track: volume, pan, reverb + delay sends, 3-band EQ, compressor and an INSERT effect:
- FILTER, DRIVE, CRUSH, CHORUS, FLANGER, PHASER, TREMOLO, AUTOPAN, RINGMOD (+ FX MIX).  Master: EQ, comp, limiter.
+ FILTER, DRIVE, CRUSH, CHORUS, FLANGER, PHASER, TREMOLO, AUTOPAN, RINGMOD, DELAY, REVERB, WAVEFOLD, TAPE, COMB,
+ FORMANT, FREQSHIFT, GATE, WIDENER, ENVFILTER, COMP (+ FX MIX).  Master: EQ, comp, limiter.
+ Every instrument (sampler and synths) also has an FX page with 2 slots of the same effects.
  Delay time is synced to BPM/speed (4 rows = 1 beat) and follows Fxx changes.
 
 <b>RSMP</b>  resample the MASTER or one TRACK (DRY / +INSERT/EQ / +SENDS) over the PATTERN, SONG or SELECTED rows
