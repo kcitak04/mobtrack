@@ -187,6 +187,8 @@ main{flex:1;min-height:0;position:relative}
 .dhead #kit-add{color:var(--smp);max-width:34%}
 .dial.smpmode .dt{color:var(--smp)}
 .dial.smpmode .dsl .trk i,.dial.smpmode .dsl b{background:var(--smp)}
+.dial.swgmode .dt{color:#6fe3d0}
+.dial.swgmode .dsl .trk i,.dial.swgmode .dsl b{background:#6fe3d0}
 /* portrait: pattern above, tools below */
 @media (orientation:portrait){
   #view-pattern{grid-template-columns:minmax(0,1fr);grid-template-rows:minmax(0,1fr) auto}
@@ -388,7 +390,8 @@ class SamplerVoice {
     this.fenv.set(p.fltA, p.fltD, p.fltS, p.fltR); this.fenv.gate();
     // WARP (1 BEATS / 2 MPC): this.pos becomes a timeline that moves at tempo speed; grains replay it at the pitch rate
     this.eng = eng;
-    this.warp = this.slice ? 0 : (p.warp | 0);
+    const wm = p.warp | 0;   // 3 = RE-PITCH: plain playback, speed follows tempo (see control)
+    this.warp = this.slice ? 0 : (wm === 1 || wm === 2 ? wm : 0);
     if (this.warp) { this.gA = { pos: 0, age: 0, len: 1, on: false }; this.gB = { pos: 0, age: 0, len: 1, on: false }; this.gc = 0; this.useB = false; this.firstGrain = true; this.ending = false; }
   }
   // one grain: BEATS = Hann window, 50% overlap (smooth); MPC = flat chunk with 2ms edges (gritty, stuttery)
@@ -437,6 +440,8 @@ class SamplerVoice {
     if (p.l2Dest > 0 && p.l2Dest < 5 && p.l2Depth > 0) this.mod(p.l2Dest, this.l2.tick(p.l2Wave, p.l2Rate, CR), p.l2Depth, m);
     const rel = (p.keytrack && !this.slice) ? this.pitch - p.root : this.pitch - this.trig;
     this.rate = this.smp.sr / sampleRate * Math.pow(2, (rel + p.coarse + p.fine * 0.01 + m.pm) / 12);
+    // RE-PITCH: START..END lasts warpBeats beats by playing faster/slower, so pitch rises and falls with tempo (like a record)
+    if (!this.slice && (p.warp | 0) === 3) this.rate *= ((this.en - this.st) / this.smp.sr) / Math.max(0.01, p.warpBeats * this.eng.beatSec);
     if (this.warp) {   // START..END lasts warpBeats beats at the current song tempo, whatever the pitch
       this.tRate = Math.max(1, this.en - this.st) / (Math.max(0.01, p.warpBeats * this.eng.beatSec) * sampleRate);
       this.G = Math.max(64, Math.round(p.grain * 0.001 * sampleRate));
@@ -865,6 +870,7 @@ class TrackerEngine extends AudioWorkletProcessor {
     this.voices = []; this.q = []; this.qh = 0;
     this.peak = new Float32Array(TRACKS * 2); this.vuN = 0; this.watch = 0; this.buses = new Map();
     this.beatSec = 0.48;   // 1 beat = 4 rows (updated by 'tempo' events; used by WARP)
+    this.clicks = []; this.segPos = 0;   // metronome clicks, rendered into the extra output TRACKS
     this.port.onmessage = e => this.onMsg(e.data);
   }
   getBus(instId, out) {
@@ -887,7 +893,10 @@ class TrackerEngine extends AudioWorkletProcessor {
         const ev = m.ev;
         for (const e of ev) e.f = e.t > 0 ? Math.round(e.t * sampleRate) : 0;
         if (this.qh > 0) { this.q = this.q.slice(this.qh); this.qh = 0; }
-        const q = this.q, needSort = q.length && ev.length && ev[0].f < q[q.length - 1].f;
+        const q = this.q;
+        // swing-delayed events can be out of order inside a batch too
+        let needSort = q.length && ev.length && ev[0].f < q[q.length - 1].f;
+        for (let i = 1; !needSort && i < ev.length; i++) if (ev[i].f < ev[i - 1].f) needSort = true;
         for (const e of ev) q.push(e);
         if (needSort) q.sort((a, b) => a.f - b.f);
         break;
@@ -925,6 +934,7 @@ class TrackerEngine extends AudioWorkletProcessor {
   }
   apply(e) {
     if (e.k === 'tempo') { this.beatSec = 4 * e.speed * 2.5 / e.bpm; return; }
+    if (e.k === 'click') { this.clicks.push({ f: e.accent ? 1760 : 1100, amp: e.accent ? 0.8 : 0.5, age: 0, start: this.segPos }); return; }
     if (e.k === 'ip') {   // automation: timed instrument parameter change (continuous params slew ~10ms)
       const r = this.insts.get(e.inst);
       if (!r) return;
@@ -982,10 +992,24 @@ class TrackerEngine extends AudioWorkletProcessor {
       const e = q[this.qh++];
       let at = e.f - f0; if (at < pos) at = pos;
       if (at > pos) { this.renderVoices(outputs, pos, at); pos = at; }
+      this.segPos = pos;
       this.apply(e);
     }
     if (this.qh && this.qh === q.length) { q.length = 0; this.qh = 0; }
     if (pos < n) this.renderVoices(outputs, pos, n);
+    this.segPos = 0;
+    const mo = outputs[TRACKS];   // metronome: short sine blips starting sample-accurately
+    if (mo && this.clicks.length) {
+      const L = mo[0], R = mo[1] || mo[0], N = Math.round(0.035 * sampleRate), dec = 0.008 * sampleRate;
+      this.clicks = this.clicks.filter(c => {
+        for (let i = c.start; i < n && c.age < N; i++, c.age++) {
+          const v = Math.sin(6.283185307179586 * c.f * c.age / sampleRate) * Math.exp(-c.age / dec) * c.amp;
+          L[i] += v; if (R !== L) R[i] += v;
+        }
+        c.start = 0;
+        return c.age < N;
+      });
+    }
     for (const [k, b] of this.buses) {
       if (b.used) b.tail = sampleRate * 0.1 | 0; else b.tail -= n;
       if (b.tail <= 0) { this.buses.delete(k); continue; }
@@ -1159,7 +1183,7 @@ onmessage = e => {
 // =====================================================================
 // 1. CONSTANTS & UTILS
 // =====================================================================
-const TRACKS = 8, FIELDS = 7, NOTE_OFF = 120, NOTE_CUT = 121, MAX_INST = 64, MAX_PATTERNS = 128, MAX_ORDER = 256;
+const TRACKS = 8, FIELDS = 8, NOTE_OFF = 120, NOTE_CUT = 121, MAX_INST = 64, MAX_PATTERNS = 128, MAX_ORDER = 256;
 const PREVIEW_CH0 = TRACKS, PREVIEW_CHS = 4;
 const NOTE_NAMES = ['C-', 'C#', 'D-', 'D#', 'E-', 'F-', 'F#', 'G-', 'G#', 'A-', 'A#', 'B-'];
 const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
@@ -1246,7 +1270,7 @@ const SAMPLER_PAGES = [
     P('xfade', 'XFADE', 0, 'len', 0, { int: 1, fmt: 'frames' }),
   ] },
   { name: 'WARP', params: [
-    P('warp', 'WARP', 0, 2, 0, { options: ['OFF', 'BEATS', 'MPC'] }),
+    P('warp', 'WARP', 0, 3, 0, { options: ['OFF', 'BEATS', 'MPC', 'RE-PITCH'] }),
     P('warpBeats', 'BEATS', 0.25, 64, 4, { exp: 1, stepv: 0.25, fmt: 'beats' }),
     P('grain', 'GRAIN', 8, 250, 50, { exp: 1, int: 1, unit: 'ms' }),
   ] },
@@ -1606,7 +1630,10 @@ function songFromObj(o) {
   s.patterns = o.patterns.slice(0, MAX_PATTERNS).map(pp => {
     const p = new Pattern(clamp(pp.rows | 0, 16, 256)), d = dec(pp.data, Int16Array), cells = p.rows * TRACKS;
     if (d.length === p.data.length) p.data.set(d);
-    else if (d.length === cells * 5) for (let k = 0; k < cells; k++) p.data.set(d.subarray(k * 5, k * 5 + 5), k * FIELDS);   // v2 files: 5 fields per cell
+    else {   // older files: 5 (v2) or 7 (v3) values per cell; the newer columns stay empty
+      const k = d.length / cells;
+      if (k === 5 || k === 7) for (let c = 0; c < cells; c++) p.data.set(d.subarray(c * k, c * k + k), c * FIELDS);
+    }
     return p;
   });
   if (!s.patterns.length) s.patterns = [new Pattern(64)];
@@ -1775,6 +1802,9 @@ class Mixer {
       t.pan.connect(t.s1).connect(this.revIn); t.pan.connect(t.s2).connect(this.dlyIn);
       this.tracks.push(t);
     }
+    // metronome output goes straight to the speakers: never through the master chain, never into exports
+    this.metro = g(); this.metro.gain.value = 0.7;
+    src.connect(this.metro, TRACKS, 0); this.metro.connect(ctx.destination);
     this.ping = null; this.irKey = ''; this.bpm = song.bpm; this.speed = song.speed;
     this.apply(true);
   }
@@ -1880,7 +1910,7 @@ class AudioEngine {
     for (const u of urls) { try { await this.ctx.audioWorklet.addModule(u()); err = null; break; } catch (e) { err = e; } }
     if (err) throw err;
     this.node = new AudioWorkletNode(this.ctx, 'tracker-engine', {
-      numberOfInputs: 0, numberOfOutputs: TRACKS, outputChannelCount: new Array(TRACKS).fill(2)
+      numberOfInputs: 0, numberOfOutputs: TRACKS + 1, outputChannelCount: new Array(TRACKS + 1).fill(2)   // + metronome
     });
     this.node.port.onmessage = e => this.onMessage(e.data);
     this.node.onprocessorerror = () => toast('Audio engine crashed - reload the page', 8000);
@@ -1968,7 +1998,10 @@ class Player {
         if (this.visited.has(key) && !this.ch.some(c => c.loopCnt > 0)) { this.ended = true; return null; }
         this.visited.add(key);
       }
-      info = { order: this.order, pat: this.pat, row: this.row }; this.doRow(time, evs);
+      info = { order: this.order, pat: this.pat, row: this.row };
+      // metronome (live playback only): every beat = 4 rows, accent on each bar of 16 rows
+      if (this.metro && this.row % 4 === 0) evs.push({ t: time, k: 'click', ch: -1, accent: this.row % 16 === 0 });
+      this.doRow(time, evs);
       if (this.bpm !== this.lastBpm || this.speed !== this.lastSpeed) {
         this.lastBpm = this.bpm; this.lastSpeed = this.speed; this.tempoEv.push({ t: time, bpm: this.bpm, speed: this.speed });
       }
@@ -1999,10 +2032,13 @@ class Player {
       const ins = smpTrack && ins0 > 0 ? (tr.kit[ins0 - 1] > 0 ? tr.kit[ins0 - 1] : -2) : ins0;
       let n = d[o];
       if (smpTrack && ins > 0 && n < 0) { const I = this.song.instruments[ins]; n = I && I.p.root != null ? I.p.root : 48; }
-      const x = pa >> 4, y = pa & 15, len = d[o + 5], au = d[o + 6];
+      const x = pa >> 4, y = pa & 15, len = d[o + 5], au = d[o + 6], sw = d[o + 7];
       if (c.gate > 0 && --c.gate === 0) evs.push({ t: time, k: 'off', ch: t });   // LEN column: note-off after N rows
+      // SWG column: this row starts late on this track by sw/256 of a row (microtiming / swing)
+      c.dly = sw > 0 ? sw / 256 * this.speed * this.tickDur : 0;
+      const tt = time + c.dly;
       if (n >= 0 && n < 120) c.gate = len > 0 ? len : 0;
-      if (au >= 0 && this.song.tracks[t].auto) evs.push({ t: time, k: 'auto', tgt: this.song.tracks[t].auto, v: au });
+      if (au >= 0 && this.song.tracks[t].auto) evs.push({ t: tt, k: 'auto', tgt: this.song.tracks[t].auto, v: au });
       c.fx = fx; c.pa = pa; c.arpOff = 0; c.delayed = null;
       let off = 0;
       if (ins > 0) { c.inst = ins; c.vol = 64; } else if (ins === -2) c.inst = 0;   // -2: empty kit slot = silence
@@ -2042,9 +2078,9 @@ class Player {
       if (n >= 0 && n < 120) {
         if (fx === 0xE && x === 0xD && y > 0) c.delayed = { n, off };
         else if ((fx === 3 || fx === 5) && c.active) c.target = n;
-        else this.trigger(c, t, n, off, time, evs);
-      } else if (n === NOTE_OFF) evs.push({ t: time, k: 'off', ch: t });
-      else if (n === NOTE_CUT) { evs.push({ t: time, k: 'cut', ch: t }); c.active = false; }
+        else this.trigger(c, t, n, off, tt, evs);
+      } else if (n === NOTE_OFF) evs.push({ t: tt, k: 'off', ch: t });
+      else if (n === NOTE_CUT) { evs.push({ t: tt, k: 'cut', ch: t }); c.active = false; }
     }
   }
   volSlide(c) { const vx = c.vsMem >> 4, vy = c.vsMem & 15; c.vol = vx ? Math.min(64, c.vol + vx) : Math.max(0, c.vol - vy); }
@@ -2081,9 +2117,10 @@ class Player {
       if (c.fx === 4 || c.fx === 6) pitch += waveVal(c.vibWave, c.vibPos) * c.vibDep / 12;
       if (c.fx === 7) vol = clamp(vol + waveVal(c.tremWave, c.tremPos) * c.tremDep * 4, 0, 64);
       vol /= 64;
-      if (pitch !== c.sPitch) { c.sPitch = pitch; evs.push({ t: time, k: 'p', ch: t, v: pitch }); }
-      if (vol !== c.sVol) { c.sVol = vol; evs.push({ t: time, k: 'v', ch: t, v: vol }); }
-      if (c.pan !== c.sPan) { c.sPan = c.pan; evs.push({ t: time, k: 'pan', ch: t, v: c.pan }); }
+      const tt = this.tick === 0 ? time + (c.dly || 0) : time;   // row start follows the SWG delay
+      if (pitch !== c.sPitch) { c.sPitch = pitch; evs.push({ t: tt, k: 'p', ch: t, v: pitch }); }
+      if (vol !== c.sVol) { c.sVol = vol; evs.push({ t: tt, k: 'v', ch: t, v: vol }); }
+      if (c.pan !== c.sPan) { c.sPan = c.pan; evs.push({ t: tt, k: 'pan', ch: t, v: c.pan }); }
     }
   }
   setOrder(o) {
@@ -2127,6 +2164,7 @@ class Scheduler {
     const ctx = this.engine.ctx; ctx.resume();
     this.player.loop = state.loop;
     this.player.start(song, order, row, mode);
+    this.player.metro = state.metro;
     this.mode = mode; this.next = ctx.currentTime + 0.04; this.playing = true; this.endAt = null;
     this.engine.mixer.setTempo(song.bpm, song.speed);
     this.worker.postMessage('start');
@@ -2171,7 +2209,7 @@ async function requestWakeLock(on) {
 let song = makeDefaultSong();
 const state = {
   tab: 'pattern', order: 0, row: 0, track: 0, field: 0, octave: 4, step: 1, inst: 1,
-  edit: true, follow: true, view: 'full', noteLen: 0, loop: true, kitSlot: new Array(TRACKS).fill(1), sel: null, selMode: false,
+  edit: true, follow: true, view: 'full', noteLen: 0, loop: true, metro: false, kitSlot: new Array(TRACKS).fill(1), sel: null, selMode: false,
   padShown: { pattern: true, instr: false, mixer: false, rsmp: false, file: false },
   rs: { src: 0, tap: 1, range: 0, tail: 1, norm: 1, warp: 1, loop: 0, dest: 0, last: 0 }, sidePage: 'edit', clip: null, playPos: null,
   mute: new Array(TRACKS).fill(false), solo: new Array(TRACKS).fill(false),
@@ -2254,13 +2292,13 @@ const undo = { snap(pi) { history.push(patEntry(song.patterns[pi])); }, undo() {
 // =====================================================================
 // 7. PATTERN EDITING
 // =====================================================================
-// cell text:  C-4 01 40 A0F 04 80   (note inst vol fx+param len auto)
-const FIELD_CHARS = [0, 4, 5, 7, 8, 10, 11, 12, 14, 15, 17, 18], FIELD_LEN = [3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1];
-const FIELD_COL = [0, 1, 1, 2, 2, 3, 4, 4, 5, 5, 6, 6];   // field -> cell data column
-const VIEWS = { compact: { fields: 3, chars: 7 }, normal: { fields: 8, chars: 14 }, full: { fields: 12, chars: 20 } };
+// cell text:  C-4 01 40 A0F 04 80 20   (note inst vol fx+param len auto swing)
+const FIELD_CHARS = [0, 4, 5, 7, 8, 10, 11, 12, 14, 15, 17, 18, 20, 21], FIELD_LEN = [3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1];
+const FIELD_COL = [0, 1, 1, 2, 2, 3, 4, 4, 5, 5, 6, 6, 7, 7];   // field -> cell data column
+const VIEWS = { compact: { fields: 3, chars: 7 }, normal: { fields: 8, chars: 14 }, full: { fields: 14, chars: 23 } };
 const numFields = () => VIEWS[state.view].fields;
 // which dial the pad shows for the cursor: LEN / AUTO columns, or the sample-slot column on SAMPLE tracks
-const dialKind = (f = state.field) => f >= 10 ? 'auto' : f >= 8 ? 'len' : (f === 1 || f === 2) && song.tracks[state.track].kind === 'sample' ? 'smp' : null;
+const dialKind = (f = state.field) => f >= 12 ? 'swg' : f >= 10 ? 'auto' : f >= 8 ? 'len' : (f === 1 || f === 2) && song.tracks[state.track].kind === 'sample' ? 'smp' : null;
 const isDialField = f => dialKind(f) !== null;
 function editPat(fn) { const pi = curPatIndex(); undo.snap(pi); fn(song.patterns[pi]); patView.dirty = true; markDirty(); }
 function liveRow() {
@@ -2311,10 +2349,11 @@ function enterHex(dg) {
       case 6: case 7: if (d[o + 3] < 0) d[o + 3] = 0; setNib(4, f === 6, 255); break;
       case 8: case 9: setNib(5, f === 8, 255); if (d[o + 5] === 0 && f === 9) d[o + 5] = -1; break;
       case 10: case 11: setNib(6, f === 10, 255); break;
+      case 12: case 13: setNib(7, f === 12, 255); break;
     }
   });
-  if ([1, 3, 5, 6, 8, 10].includes(f)) { state.field++; patView.dirty = true; }
-  else { state.field = { 2: 1, 4: 3, 7: 5, 9: 8, 11: 10 }[f]; advance(); }
+  if ([1, 3, 5, 6, 8, 10, 12].includes(f)) { state.field++; patView.dirty = true; }
+  else { state.field = { 2: 1, 4: 3, 7: 5, 9: 8, 11: 10, 13: 12 }[f]; advance(); }
 }
 function clearField() {
   if (!state.edit) return;
@@ -2327,7 +2366,8 @@ function clearField() {
     else if (f <= 7) { d[o + 3] = -1; d[o + 4] = -1; }
     else d[o + FIELD_COL[f]] = -1;
   });
-  state.field = { 2: 1, 4: 3, 6: 5, 7: 5, 9: 8, 11: 10 }[f] != null ? { 2: 1, 4: 3, 6: 5, 7: 5, 9: 8, 11: 10 }[f] : f;
+  const back = { 2: 1, 4: 3, 6: 5, 7: 5, 9: 8, 11: 10, 13: 12 };
+  state.field = back[f] != null ? back[f] : f;
   advance();
 }
 function selRect(orCursor) {
@@ -2664,7 +2704,7 @@ class ParamBox {
 // =====================================================================
 const C = {
   bg: '#050807', panel: '#0d1311', row4: '#0b1310', row16: '#102019', curRow: '#15302a', playRow: '#1b4d2d', sel: 'rgba(82,212,255,.22)',
-  note: '#e6f5ec', inst: '#52d4ff', vol: '#39ff88', fx: '#ffb13b', par: '#ffd88a', empty: '#26342e', off: '#ff4d61', len: '#b99bff', auto: '#ff7ad9', smp: '#ffd24a',
+  note: '#e6f5ec', inst: '#52d4ff', vol: '#39ff88', fx: '#ffb13b', par: '#ffd88a', empty: '#26342e', off: '#ff4d61', len: '#b99bff', auto: '#ff7ad9', smp: '#ffd24a', swg: '#6fe3d0',
   num: '#4a5d55', numHi: '#b9d4c6', line: '#1c2723', acc: '#39ff88', mute: '#3a1016', wave: '#39ff88',
   hdr: '#0f1714', hdrSel: '#15241f', hdrTxt: '#b9d4c6', hdrSelTxt: '#39ff88', msOff: '#1d2925', msTxt: '#7d948a', muteOn: '#ff4d61', muteTxt: '#fff',
   soloOn: '#39ff88', soloTxt: '#000', vuBg: '#0a110e', meter: '#39ff88', meterHot: '#ffb13b', meterClip: '#ff4d61', trackColors: null, trackTxt: '#000',
@@ -2720,7 +2760,7 @@ class PatternView {
     const row = Math.floor(this.scrollY + (y - this.headH) / this.rowH);
     const c = Math.floor((lx - this.cw * 0.5) / this.cw);
     let field;
-    field = c <= 3 ? 0 : c === 4 ? 1 : c <= 6 ? 2 : c === 7 ? 3 : c <= 9 ? 4 : c === 10 ? 5 : c === 11 ? 6 : c <= 13 ? 7 : c === 14 ? 8 : c <= 16 ? 9 : c === 17 ? 10 : 11;
+    field = c <= 3 ? 0 : c === 4 ? 1 : c <= 6 ? 2 : c === 7 ? 3 : c <= 9 ? 4 : c === 10 ? 5 : c === 11 ? 6 : c <= 13 ? 7 : c === 14 ? 8 : c <= 16 ? 9 : c === 17 ? 10 : c <= 19 ? 11 : c === 20 ? 12 : 13;
     field = Math.min(field, numFields() - 1);
     return { type: 'cell', row, track: t, field };
   }
@@ -2866,9 +2906,10 @@ class PatternView {
     if (f < 0) { g.fillStyle = C.empty; g.fillText('...', x + cw * 10, y); }
     else { g.fillStyle = C.fx; g.fillText(hex(f, 1), x + cw * 10, y); g.fillStyle = C.par; g.fillText(hex(Math.max(0, pa)), x + cw * 11, y); }
     if (state.view !== 'full') return;
-    const ln = d[o + 5], au = d[o + 6];
+    const ln = d[o + 5], au = d[o + 6], sw = d[o + 7];
     g.fillStyle = ln < 0 ? C.empty : C.len; g.fillText(ln < 0 ? '..' : hex(ln), x + cw * 14, y);
     g.fillStyle = au < 0 ? C.empty : C.auto; g.fillText(au < 0 ? '..' : hex(au), x + cw * 17, y);
+    g.fillStyle = sw < 0 ? C.empty : C.swg; g.fillText(sw < 0 ? '..' : hex(sw), x + cw * 20, y);
   }
 }
 
@@ -3065,7 +3106,7 @@ class WaveView {
       const nb = p.warpBeats;
       g.fillStyle = C.warpGrid;
       for (let b = 1; b < nb; b++) { const x = this.f2x(st + (en - st) * b / nb); if (x > 0 && x < W) g.fillRect(x, 0, 1, H); }
-      g.fillStyle = C.smp; g.fillText((p.warp === 2 ? 'MPC WARP  ' : 'WARP  ') + fmtParam({ fmt: 'beats' }, nb), 8, H - 34);
+      g.fillStyle = C.smp; g.fillText((p.warp === 2 ? 'MPC WARP  ' : p.warp === 3 ? 'RE-PITCH  ' : 'WARP  ') + fmtParam({ fmt: 'beats' }, nb), 8, H - 34);
     }
     // markers with flags (flags are the drag handles)
     for (const m of MARKERS) {
@@ -3634,10 +3675,10 @@ function buildTop() {
   top.append(ui.pCur = btn('▶CUR', () => play('cursor'), '', true));
   top.append(btn('■', stop, 'red', true));
   top.append(ui.loop = btn('LOOP', () => { state.loop = !state.loop; player.loop = state.loop; refreshTransport(); }));
+  top.append(ui.metro = btn('METRO', () => { state.metro = !state.metro; player.metro = state.metro; refreshTransport(); }));
   top.append(el('div', { class: 'sep' }));
   const tempo = () => { markDirty(); if (engine.ready) engine.mixer.setTempo(sched.playing ? player.bpm : song.bpm, sched.playing ? player.speed : song.speed); };
   top.append(new NumBox('BPM', () => song.bpm, v => { song.bpm = v; if (sched.playing) player.bpm = v; tempo(); }, { min: 32, max: 255, px: 4, hist: 'BPM' }).el);
-  top.append(new NumBox('SPEED', () => song.speed, v => { song.speed = v; if (sched.playing) player.speed = v; tempo(); }, { min: 1, max: 31, px: 14, hist: 'speed' }).el);
   top.append(new NumBox('OCT', () => state.octave, v => { state.octave = v; refreshPad(); }, { min: 0, max: 8, px: 20 }).el);
   top.append(new NumBox('STEP', () => state.step, v => state.step = v, { min: 0, max: 16, px: 14 }).el);
   top.append(el('div', { class: 'sep' }));
@@ -3778,9 +3819,9 @@ function buildPad() {
 // ---- dial pad: LEN (note length in rows) and AUTO (automation value 00-FF) columns ----
 const dial = { held: false, lastRow: -1, val: -1 };
 function dialInfo() {
-  const kind = dialKind(), auto = kind === 'auto', smp = kind === 'smp', col = { len: 5, auto: 6, smp: 1 }[kind] || 5, p = curPat(), row = liveRow();
-  return { kind, auto, smp, col, row, raw: p.data[p.i(row, state.track) + col], r: auto ? autoResolve(song.tracks[state.track].auto) : null,
-    min: auto ? 0 : 1, max: auto ? 255 : smp ? Math.max(1, song.tracks[state.track].kit.length) : Math.min(255, p.rows) };
+  const kind = dialKind(), auto = kind === 'auto', smp = kind === 'smp', swg = kind === 'swg', col = { len: 5, auto: 6, smp: 1, swg: 7 }[kind] || 5, p = curPat(), row = liveRow();
+  return { kind, auto, smp, swg, col, row, raw: p.data[p.i(row, state.track) + col], r: auto ? autoResolve(song.tracks[state.track].auto) : null,
+    min: auto ? 0 : 1, max: auto || swg ? 255 : smp ? Math.max(1, song.tracks[state.track].kit.length) : Math.min(255, p.rows) };
 }
 function dialWrite(raw, audition) {
   const di = dialInfo(), p = curPat();
@@ -3795,7 +3836,7 @@ function nudge(d) {
   const di = dialInfo();
   if (di.auto && !di.r) return toast('Choose an automation target for this track first');
   let raw = di.raw;
-  if (raw < 0) raw = di.auto ? autoRaw(di.r) : di.smp ? kitSlot(state.track) - d : 4;
+  if (raw < 0) raw = di.auto ? autoRaw(di.r) : di.smp ? kitSlot(state.track) - d : di.swg ? 0x40 : 4;
   dial.heard = null;
   if (state.edit) undo.snap(curPatIndex());
   dialWrite(clamp(raw + d, di.min, di.max), true);
@@ -3876,8 +3917,9 @@ function fillTargets() {
 function refreshDial() {
   if (!ui.dTitle || state.tab !== 'pattern' || !isDialField(state.field)) return;
   const di = dialInfo();
-  ui.dTitle.textContent = di.auto ? 'AUTO' : di.smp ? 'SAMPLE' : 'LEN';
+  ui.dTitle.textContent = di.auto ? 'AUTO' : di.smp ? 'SAMPLE' : di.swg ? 'SWING' : 'LEN';
   ui.dialWrap.classList.toggle('smpmode', di.smp);
+  ui.dialWrap.classList.toggle('swgmode', di.swg);
   ui.dTarget.hidden = !di.auto; ui.dKitAdd.hidden = !di.smp; ui.dKitDel.hidden = !di.smp;
   if (di.auto) fillTargets();
   if (di.smp) fillKitAdd();
@@ -3885,6 +3927,10 @@ function refreshDial() {
   if (di.smp) {
     const kit = song.tracks[state.track].kit, nm = s => { const id = kit[s - 1] | 0; return id ? (song.instruments[id].name || 'INST ' + hex(id)) : '(empty slot)'; };
     txt = !kit.length ? 'kit is empty: + ADD a sample' : di.raw < 0 ? '.. (next: ' + hex(kitSlot(state.track)) + ' ' + nm(kitSlot(state.track)) + ')' : hex(di.raw) + ' = ' + nm(di.raw) + '   [' + kit.length + ' in kit]';
+  }
+  else if (di.swg) {
+    const ms = raw => Math.round(raw / 256 * song.speed * 2.5 / song.bpm * 1000);
+    txt = di.raw < 0 ? '.. (on time)' : hex(di.raw) + ' = ' + Math.round(di.raw / 256 * 100) + '% of a row late (' + ms(di.raw) + ' ms)';
   }
   else if (di.auto) txt = !di.r ? 'pick a target →' : di.raw < 0 ? '.. (now ' + fmtParam(di.r.pd, di.r.obj[di.r.key], di.r.ins) + ')' : hex(di.raw) + ' = ' + fmtParam(di.r.pd, autoValue(di.r, di.raw), di.r.ins);
   else txt = di.raw < 0 ? '.. (holds until next note / OFF)' : hex(di.raw) + ' = ' + di.raw + (di.raw === 1 ? ' row' : ' rows');
@@ -3908,7 +3954,7 @@ function refreshPad() {
 function refreshTransport() {
   const m = sched.playing ? sched.mode : null;
   ui.pSong.classList.toggle('on', m === 'song'); ui.pPat.classList.toggle('on', m === 'pattern');
-  ui.loop.classList.toggle('on', state.loop); ui.edit.classList.toggle('on', state.edit);
+  ui.loop.classList.toggle('on', state.loop); ui.edit.classList.toggle('on', state.edit); ui.metro.classList.toggle('on', state.metro);
   renderOrderList();
 }
 // ---- instrument view ----
@@ -4405,7 +4451,10 @@ function frame() {
 $('#helptext').innerHTML = `<b>MOBTRACK — quick reference</b>   (tap anywhere to close)
 
 <b>PATTERN</b>  tap a cell to move the cursor · drag to scroll · track header: M = mute, S = solo
- Cell:  NOTE  INS  VOL  FX PARAM  LEN  AUTO     e.g.  C-4 01 40 A0F 04 80     (VIEW button: FULL / NORMAL / COMPACT)
+ Cell:  NOTE  INS  VOL  FX PARAM  LEN  AUTO  SWG     e.g.  C-4 01 40 A0F 04 80 20     (VIEW: FULL / NORMAL / COMPACT)
+ SWG  = swing / microtiming: this row plays late by SWG/256 of a row on this track (40 = a quarter row, 80 = half).
+        Dial it like LEN/AUTO; e.g. put 30-50 on every second row for a shuffle. Visible in the FULL view.
+ BPM  = real tempo (4 rows = 1 beat). METRO clicks every beat (accent each 16 rows) while playing, never in exports.
  LEN  = note length in rows (note-off after N rows). The LEN box on the piano pad writes it with every new note.
  AUTO = automation value 00-FF for the track's target. On the LEN/AUTO columns the pad becomes a dial:
         drag the big slider to write the value on this row (you hear it right away); pick the target in the list.
@@ -4443,7 +4492,8 @@ $('#helptext').innerHTML = `<b>MOBTRACK — quick reference</b>   (tap anywhere 
 <b>UNDO / REDO</b> (top bar) undo everything: pattern edits, values, sample edits, presets, instruments, order list.
  WARP page: OFF = classic (pitch changes speed). BEATS = time-stretch: START..END always lasts BEATS beats at the
    song tempo (4 rows = 1 beat), notes change pitch only. MPC = old MPC-style stretch: hard-edged grains, gritty
-   and stuttery (bigger GRAIN = choppier). FIT TO TEMPO guesses BEATS from the length. Follows BPM/speed and Fxx.
+   and stuttery (bigger GRAIN = choppier). RE-PITCH = tempo-synced by speed: faster tempo = higher pitch, like a
+   record (no grain artifacts). FIT TO TEMPO guesses BEATS from the length. Follows BPM and Fxx.
  SLICE page: EQUAL or DETECT (transients) → KEYS (slice n plays at ROOT+n) or → INSTRS (one instrument per slice)
 
 <b>SYNTHS</b>  INST tab → type selector: BASS, FM, PAD, LEAD. PRESET list, ◂ ▸, RANDOM, INIT.  POLY = max voices.
