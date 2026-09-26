@@ -189,7 +189,8 @@ main{flex:1;min-height:0;position:relative}
 .noteinfo.show{opacity:1}
 .noteinfo b{color:var(--acc);font-size:13px;white-space:nowrap}
 .noteinfo span{color:var(--text);font-size:11px}
-#pat-wrap .noteinfo canvas{position:static;inset:auto;display:block;width:220px;height:45px;border-radius:2px}
+.noteinfo canvas,#pat-wrap .noteinfo canvas{position:static;inset:auto;display:block;width:220px;height:45px;border-radius:2px}
+.noteinfo.fixed{position:fixed;z-index:30}
 .btn.fxlbl{min-width:0;padding:0 6px;color:var(--dim);writing-mode:vertical-rl;transform:rotate(180deg);font-size:10px;letter-spacing:1px}
 .btn.smp{background:var(--smpbg);color:var(--smp);border-color:var(--smp)}
 .dhead #kit-add{color:var(--smp);max-width:34%}
@@ -3162,7 +3163,17 @@ function noteInfo(t, row) {
   while (ins < 0 && r > 0) { r--; ins = d[p.i(r, t) + 1]; }
   const id = smpT ? (ins > 0 ? tr.kit[ins - 1] | 0 : 0) : Math.max(0, ins), I = id ? song.instruments[id] : null;
   if (n < 0 || n >= 120) n = I && I.p.root != null ? I.p.root : 48;   // slot-only row: natural pitch
-  const out = { note: noteName(n), id, ins: I, slot: smpT && ins > 0 ? ins : 0 };
+  return describeNote(id, n, smpT && ins > 0 ? ins : 0);
+}
+// what a piano key plays right now: the kit slot's sample on a SAMPLE track (pattern tab), else the current instrument
+function keyInfo(note) {
+  const smpT = state.tab === 'pattern' && isSmpTrack(state.track), slot = smpT ? kitSlot(state.track) : 0;
+  const fromKit = smpT && kitInst(state.track, slot) > 0, id = fromKit ? kitInst(state.track, slot) : state.inst;
+  return describeNote(id, note, fromKit ? slot : 0);
+}
+function describeNote(id, n, slot) {
+  const I = id ? song.instruments[id] : null;
+  const out = { note: noteName(n), id, ins: I, slot };
   if (I && I.type === 'sampler') {
     const s = instSample(I);
     if (s) {
@@ -3188,10 +3199,7 @@ function drawRegion(cv, s, a, b) {
     if (hi >= lo) g.fillRect(x, mid - hi * mid * 0.92, 1, Math.max(1, (hi - lo) * mid * 0.92));
   }
 }
-function showNoteInfo(t, row) {
-  const info = noteInfo(t, row);
-  if (!info) return false;
-  hideNoteInfo(true);
+function infoBox(info) {
   const I = info.ins, box = el('div', { class: 'noteinfo', id: 'noteinfo' });
   box.append(el('b', { text: info.note + '   ' + (I ? hex(info.id) + ' ' + (I.name || INSTRUMENT_TYPES[I.type].label) : 'no instrument') }));
   let line = info.slot ? 'KIT SLOT ' + hex(info.slot) + '   ' : '';
@@ -3204,11 +3212,30 @@ function showNoteInfo(t, row) {
   } else if (I) line += 'empty instrument (no sample)';
   box.append(el('span', { text: line }));
   if (info.s && !info.noSlice) { const cv = el('canvas', { width: 440, height: 90 }); drawRegion(cv, info.s, info.a, info.b); box.append(cv); }
-  const wrap = $('#pat-wrap');
+  return box;
+}
+function showNoteInfo(t, row) {
+  const info = noteInfo(t, row);
+  if (!info) return false;
+  hideNoteInfo(true);
+  const box = infoBox(info), wrap = $('#pat-wrap');
   wrap.append(box);
   const pv = patView, x = pv.numW + t * pv.trackW - pv.scrollX, y = pv.headH + (row - pv.scrollY) * pv.rowH, bw = box.offsetWidth, bh = box.offsetHeight;
   box.style.left = clamp(x, 2, Math.max(2, wrap.clientWidth - bw - 2)) + 'px';
   box.style.top = (y - bh - 6 >= 0 ? y - bh - 6 : Math.min(y + pv.rowH + 6, wrap.clientHeight - bh - 2)) + 'px';
+  requestAnimationFrame(() => box.classList.add('show'));
+  return true;
+}
+// piano key held 1.5s: same box, floating above the key
+function showKeyInfo(keyEl, note) {
+  if (note < 0 || note > 119) return false;
+  hideNoteInfo(true);
+  const box = infoBox(keyInfo(note));
+  box.classList.add('fixed');
+  document.body.append(box);
+  const r = keyEl.getBoundingClientRect(), bw = box.offsetWidth, bh = box.offsetHeight;
+  box.style.left = clamp(r.left + r.width / 2 - bw / 2, 4, innerWidth - bw - 4) + 'px';
+  box.style.top = Math.max(4, r.top - bh - 8) + 'px';
   requestAnimationFrame(() => box.classList.add('show'));
   return true;
 }
@@ -4113,8 +4140,15 @@ function buildPad() {
       const note = state.octave * 12 + sIdx;
       previewDown(e.pointerId, note);
       if (state.tab === 'pattern' && state.field === 0) enterNote(note);
+      // hold the key 1.5s: show which sample / slice / synth it plays
+      clearTimeout(k.lp); k.lpShown = false;
+      k.lp = setTimeout(() => { if (k.classList.contains('down')) k.lpShown = showKeyInfo(k, note); }, 1500);
     });
-    const up = e => { k.classList.remove('down'); previewUp(e.pointerId); };
+    const up = e => {
+      k.classList.remove('down'); previewUp(e.pointerId);
+      clearTimeout(k.lp);
+      if (k.lpShown) { k.lpShown = false; hideNoteInfo(false); }   // fades 1s after release
+    };
     k.addEventListener('pointerup', up); k.addEventListener('pointercancel', up);
     k.dataset.s = sIdx; ui.pianoKeys.push(k); piano.append(k);
   }
@@ -4787,6 +4821,7 @@ $('#helptext').innerHTML = `<b>MOBTRACK — quick reference</b>   (tap anywhere 
         There are 4 automation lanes per row, each with its own target per track: the AUTO n/4 button in the
         EDIT tools switches which lane the AUTO column shows (the track type switch is the button below it).
  HOLD a note (or a sample slot) still for 1.5 s: a box shows which instrument, sample, slice and region it plays.
+ The same works on the piano keys: hold a key 1.5 s to see what that key plays right now.
  Note field → piano pad (edit mode writes note + current instrument).  Other fields → hex pad.
  Hex entry: hi digit → lo digit → next row (by STEP).   OFF (===) = note-off/release, CUT (^^^) = fast cut
  SEL mode: drag to select a block → COPY/CUT/PASTE/CLEAR/transpose/INTERP (interpolates the cursor's column)
