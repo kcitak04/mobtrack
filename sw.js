@@ -1,4 +1,4 @@
-// MOBTRACK service worker: makes the app work offline.
+// DATTRACK service worker: makes the app work offline.
 // Network first, so a new version is used as soon as it is online; the cached copy is the offline fallback.
 const CACHE = 'mobtrack-v1';
 const ASSETS = ['./', './index.html', './manifest.webmanifest', './icon-192.png', './icon-512.png', './icon-maskable-512.png'];
