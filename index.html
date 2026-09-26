@@ -204,7 +204,10 @@ main{flex:1;min-height:0;position:relative}
 .btn.lab{color:var(--lab,#c38bff);border-color:var(--lab,#c38bff)}
 .btn.lab.big{background:var(--lab,#c38bff);color:var(--ontext)}
 .labtitle{color:var(--lab,#c38bff);font-size:16px;letter-spacing:2px}
-.labprocs{display:flex;flex-wrap:wrap;gap:5px}
+.labprocs{display:flex;flex-direction:column;gap:5px}
+.labcat{display:flex;gap:8px;align-items:flex-start}
+.labcat>span{flex:none;width:84px;padding-top:9px;font-size:9px;letter-spacing:1px;color:var(--dim);line-height:1.3}
+.labbtns{flex:1;display:flex;flex-wrap:wrap;gap:5px;min-width:0}
 .labprocs .btn{min-height:34px;font-size:11px;color:var(--lab,#c38bff)}
 .labprocs .btn.on{background:var(--lab,#c38bff);border-color:var(--lab,#c38bff);color:var(--ontext)}
 .labdesc{color:var(--text);max-width:720px}
@@ -1574,6 +1577,55 @@ const peak = a => { let p = 0; for (let i = 0; i < a.length; i++) { const v = Ma
 const lerpAt = (x, p) => { const i = Math.floor(p), f = p - i; if (i < 0 || i >= x.length) return 0; return x[i] + ((i + 1 < x.length ? x[i + 1] : 0) - x[i]) * f; };
 function fades(a, fi, fo) { for (let i = 0; i < fi && i < a.length; i++) a[i] *= i / fi; for (let i = 0; i < fo && i < a.length; i++) a[a.length - 1 - i] *= i / fo; }
 let MAXLEN = 0;
+// generic STFT pass: fn edits magnitude/phase of bins 0..N/2 of each frame (st = per-channel state)
+function stftRun(ch, sr, win, prog, outLen, fn) {
+  const N = pow2(win * sr), H = N >> 2, w = hann(N), half = N >> 1, frames = Math.ceil(outLen / H) + 1;
+  const re = new Float64Array(N), im = new Float64Array(N), mag = new Float64Array(half + 1), ph = new Float64Array(half + 1);
+  return ch.map((x, c) => {
+    const out = new Float32Array(outLen), st = { c, N, H, half, w };
+    for (let f = 0; f < frames; f++) {
+      const pos = f * H - half;
+      analyze(x, pos, w, re, im);
+      for (let k = 0; k <= half; k++) { mag[k] = Math.hypot(re[k], im[k]); ph[k] = Math.atan2(im[k], re[k]); }
+      fn(mag, ph, st, f, pos);
+      for (let k = 0; k <= half; k++) { re[k] = mag[k] * Math.cos(ph[k]); im[k] = mag[k] * Math.sin(ph[k]); }
+      mirror(re, im); synth(out, pos, w, re, im, 2 / 3);
+      if (!(f & 15)) prog((c + f / frames) / ch.length);
+    }
+    return out;
+  });
+}
+// smoothed spectral envelope (moving average over +-B bins)
+function envelope(m, B, out) {
+  const n = m.length, ps = new Float64Array(n + 1); B = Math.max(1, B | 0);
+  for (let i = 0; i < n; i++) ps[i + 1] = ps[i] + m[i];
+  for (let i = 0; i < n; i++) { const a = Math.max(0, i - B), b = Math.min(n, i + B + 1); out[i] = (ps[b] - ps[a]) / (b - a) + 1e-9; }
+  return out;
+}
+// phase vocoder re-mapping: every partial's true frequency (in bins) goes through map()
+function pvMap(mag, ph, st, map) {
+  const { half, N, H } = st, exp = TAU * H / N;
+  if (!st.pv) st.pv = { last: new Float64Array(half + 1), acc: new Float64Array(half + 1), nm: new Float64Array(half + 1), nf: new Float64Array(half + 1) };
+  const s = st.pv; s.nm.fill(0); s.nf.fill(0);
+  for (let k = 0; k <= half; k++) {
+    let d = ph[k] - s.last[k] - k * exp; s.last[k] = ph[k]; d -= TAU * Math.round(d / TAU);
+    const nf = map(k + d / exp), j = Math.round(nf);
+    if (j > 0 && j <= half && mag[k] > s.nm[j]) { s.nm[j] = mag[k]; s.nf[j] = nf; }
+  }
+  for (let k = 0; k <= half; k++) { s.acc[k] += s.nf[k] * exp; mag[k] = s.nm[k]; ph[k] = s.acc[k]; }
+}
+function peakBins(mag, half) { const pk = []; for (let k = 1; k < half; k++) if (mag[k] > mag[k - 1] && mag[k] >= mag[k + 1]) pk.push(k); return pk.sort((a, b) => mag[b] - mag[a]); }
+// wavesets: spans between upward zero crossings of the mono sum, in groups of G
+function wsets(ch, G) {
+  const n = ch[0].length, zc = [0]; let prev = 0;
+  for (let i = 0; i < n; i++) { let s = 0; for (const c of ch) s += c[i]; if (prev < 0 && s >= 0 && i - zc[zc.length - 1] > 1) zc.push(i); prev = s; }
+  const segs = [];
+  for (let i = 0; i < zc.length; i += G) { const a = zc[i], b = i + G < zc.length ? zc[i + G] : n; if (b > a) segs.push([a, b]); }
+  return segs;
+}
+const catF = parts => { let n = 0; for (const p of parts) n += p.length; const o = new Float32Array(n); let i = 0; for (const p of parts) { o.set(p, i); i += p.length; } return o; };
+const resamp = (seg, n) => { const o = new Float32Array(Math.max(1, n)), r = seg.length / o.length; for (let i = 0; i < o.length; i++) o[i] = lerpAt(seg, i * r); return o; };
+const panG = pan => [Math.cos(pan * Math.PI / 2), Math.sin(pan * Math.PI / 2)];
 // ---- processes: each gets the channels (Float32Array[]), sample rate, params, progress(0..1); returns new channels ----
 const PROCS = {
   // extreme time stretch with random phases (Paul's stretch)
@@ -1602,6 +1654,11 @@ const PROCS = {
       for (const o of [-H, 0, H]) { analyze(x, at + o, w, re, im); for (let k = 0; k <= N >> 1; k++) mag[k] += Math.hypot(re[k], im[k]) / 3; }
       const out = new Float32Array(outLen), drift = new Float64Array(mag.length).fill(1); seed(p.seed);
       for (let f = 0; f < frames; f++) {
+        if (p.scan > 0) {   // SCAN: the frozen moment slowly glides forward through the sound
+          const pf = Math.round(clamp(p.pos + p.scan * (1 - p.pos) * f / frames, 0, 1) * Math.max(0, len - N));
+          analyze(x, pf, w, re, im);
+          for (let k = 0; k <= N >> 1; k++) mag[k] = mag[k] * 0.85 + Math.hypot(re[k], im[k]) * 0.15;
+        }
         for (let k = 0; k <= N >> 1; k++) {
           drift[k] += ((1 + (rand() * 2 - 1) * p.shimmer * 1.5) - drift[k]) * 0.25;
           const m = mag[k] * Math.max(0, drift[k]), ph = rand() * TAU; re[k] = m * Math.cos(ph); im[k] = m * Math.sin(ph);
@@ -1843,6 +1900,303 @@ const PROCS = {
       for (let i = 0; i < outLen; i++) out[i] = out[i] * g2 * p.mix + (i < len ? x[i] : 0) * (1 - p.mix);
       return out;
     });
+  },
+  // ===== spectral =====
+  // MORPH: interpolate magnitudes + phases with a second sound; GLIDE: A turns into B over the length; VOCODE: impose B's envelope/formants on A
+  morph(ch, sr, p, prog, aux) {
+    if (!aux) throw new Error('Choose a MODULATOR sample');
+    const len = ch[0].length;
+    return stftRun(ch, sr, p.win, prog, len + pow2(p.win * sr), (mag, ph, st, f, pos) => {
+      const { N, half, w } = st;
+      if (!st.a) st.a = { re: new Float64Array(N), im: new Float64Array(N), m: new Float64Array(half + 1), e1: new Float64Array(half + 1), e2: new Float64Array(half + 1) };
+      const A = st.a, y = aux[st.c % aux.length], t = clamp((pos + half) / len, 0, 1);
+      analyze(y, Math.round(t * y.length) - half, w, A.re, A.im);
+      for (let k = 0; k <= half; k++) A.m[k] = Math.hypot(A.re[k], A.im[k]);
+      if (p.mode === 2) {
+        const B = p.detail / (sr / N);
+        envelope(mag, B, A.e1); envelope(A.m, B, A.e2);
+        for (let k = 0; k <= half; k++) mag[k] *= Math.pow(Math.min(1000, A.e2[k] / A.e1[k]), p.amount);
+      } else {
+        const a = p.mode === 1 ? t : p.amount;
+        for (let k = 0; k <= half; k++) {
+          const p2 = Math.atan2(A.im[k], A.re[k]);
+          mag[k] = Math.pow(mag[k] + 1e-12, 1 - a) * Math.pow(A.m[k] + 1e-12, a);
+          ph[k] = Math.atan2((1 - a) * Math.sin(ph[k]) + a * Math.sin(p2), (1 - a) * Math.cos(ph[k]) + a * Math.cos(p2));
+        }
+      }
+    });
+  },
+  // SPEC TUNE: a comb of pitch templates (scale / chord / harmonic series), optionally stepping through a progression
+  tune(ch, sr, p, prog) {
+    const SC = [[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11], [0, 2, 4, 5, 7, 9, 11], [0, 2, 3, 5, 7, 8, 10], [0, 2, 4, 7, 9], [0, 2, 4, 6, 8, 10], [0, 4, 7, 11], [0, 2, 3, 7, 10], null, null][p.scale];
+    const PR = [[0], [0, 5, 7, 0], [0, 8, 3, 10], [0, 2, 4, 5, 7, 9, 11, 12], [12, 11, 9, 7, 5, 4, 2, 0]][p.prog], len = ch[0].length;
+    return stftRun(ch, sr, 0.19, prog, len + pow2(0.19 * sr), (mag, ph, st, f, pos) => {
+      const { N, half } = st, bin = sr / N, t = clamp((pos + half) / len, 0, 0.9999), f0 = 440 * Math.pow(2, (p.note + PR[Math.floor(t * PR.length)] - 69) / 12);
+      for (let k = 1; k <= half; k++) {
+        const fr = k * bin; let cents;
+        if (p.scale === 8) { const n = Math.max(1, Math.round(fr / f0)); cents = 1200 * Math.abs(Math.log2(fr / (n * f0))); }
+        else {
+          const rel = 12 * Math.log2(fr / f0), pc = ((rel % 12) + 12) % 12; let best = 99;
+          if (!SC) best = Math.abs(pc * 2 - Math.round(pc * 2)) / 2;   // quarter tones
+          else for (const d of SC) { const dd = Math.abs(pc - d); best = Math.min(best, dd, 12 - dd); }
+          cents = best * 100;
+        }
+        mag[k] *= 1 - p.amount + p.amount * Math.exp(-Math.pow(cents / p.width, 2));
+      }
+      mag[0] *= 1 - p.amount;
+    });
+  },
+  // STRETCH: partials f -> c*(f/c)^s (inharmonic). INVERT: spectrum mirrored around c in log frequency (f -> c²/f)
+  sinv(ch, sr, p, prog) {
+    const len = ch[0].length, fc = p.center;
+    return stftRun(ch, sr, p.win, prog, len + pow2(p.win * sr), (mag, ph, st) => {
+      const bin = sr / st.N;
+      pvMap(mag, ph, st, tf => {
+        let fr = tf * bin; if (fr <= 1) return -1;
+        if (p.mode !== 1) fr = fc * Math.pow(fr / fc, p.stretch);
+        if (p.mode !== 0) fr = fc * fc / fr;
+        return fr / bin;
+      });
+    });
+  },
+  // FOCUS: keep only the strongest spectral peaks; RING lets them sustain (resonate) after the input moves on
+  focus(ch, sr, p, prog) {
+    const len = ch[0].length, tail = Math.round(Math.min(8, p.ring) * sr);
+    return stftRun(ch, sr, p.win, prog, Math.min(MAXLEN, len + tail + pow2(p.win * sr)), (mag, ph, st) => {
+      const { half, N, H } = st;
+      if (!st.h) { st.h = new Float64Array(half + 1); st.hp = new Float64Array(half + 1); st.keep = new Uint8Array(half + 1); }
+      const pk = peakBins(mag, half);
+      st.keep.fill(0);
+      for (let i = 0; i < Math.min(p.peaks, pk.length); i++) for (let d = -p.width; d <= p.width; d++) { const j = pk[i] + d; if (j >= 0 && j <= half) st.keep[j] = 1; }
+      const dec = p.ring > 0.01 ? Math.exp(-H / sr / (p.ring / 6.9)) : 0, exp = TAU * H / N;
+      for (let k = 0; k <= half; k++) {
+        const m = st.keep[k] ? mag[k] : mag[k] * (1 - p.depth);
+        if (m >= st.h[k] * dec) { st.h[k] = m; st.hp[k] = ph[k]; } else { st.h[k] *= dec; st.hp[k] += k * exp; }
+        mag[k] = st.h[k]; ph[k] = st.hp[k];
+      }
+    });
+  },
+  // MASK: filter against the spectrum profile of another sample · STRIP PEAKS: remove the strongest partials (fundamentals)
+  // TRANSIENTS / SUSTAIN: keep only the rising (onset) or the steady part of every bin
+  mask(ch, sr, p, prog, aux) {
+    const len = ch[0].length, N = pow2(p.win * sr), half = N >> 1;
+    let prof = null;
+    if (p.mode === 0) {
+      if (!aux) throw new Error('Choose a MASK sample');
+      prof = aux.map(y => {
+        const w = hann(N), re = new Float64Array(N), im = new Float64Array(N), pr = new Float64Array(half + 1);
+        for (let pos = 0; pos < y.length; pos += N >> 1) { analyze(y, pos, w, re, im); for (let k = 0; k <= half; k++) pr[k] += Math.hypot(re[k], im[k]); }
+        const mx = peak(pr) || 1; for (let k = 0; k <= half; k++) pr[k] /= mx;
+        return pr;
+      });
+    }
+    return stftRun(ch, sr, p.win, prog, len + N, (mag, ph, st) => {
+      if (p.mode === 0) { const pr = prof[st.c % prof.length]; for (let k = 0; k <= half; k++) mag[k] *= Math.max(0, 1 - p.amount * Math.sqrt(pr[k])); }
+      else if (p.mode === 1) {
+        const pk = peakBins(mag, half), n = Math.round(1 + p.amount * 31);
+        for (let i = 0; i < Math.min(n, pk.length); i++) for (let d = -1; d <= 1; d++) { const j = pk[i] + d; if (j >= 0 && j <= half) mag[j] *= 0.02; }
+      } else {
+        if (!st.prev) st.prev = new Float64Array(half + 1);
+        for (let k = 0; k <= half; k++) {
+          const m = mag[k], g = clamp(1 - st.prev[k] * 1.3 / (m + 1e-9), 0, 1); st.prev[k] = m;
+          mag[k] = m * (1 - p.amount + p.amount * (p.mode === 2 ? g : 1 - g));
+        }
+      }
+    });
+  },
+  // ===== waveset (zero-crossing cycles) =====
+  wdist(ch, sr, p, prog) {
+    const segs = wsets(ch, p.group), R = Math.round(p.amt); seed(p.seed);
+    const plan = segs.map(() => rand() < p.chance), order = segs.map((_, i) => i);
+    if (p.mode === 5) for (let i = 0; i < order.length; i++) if (plan[i]) { const j = clamp(i + Math.round((rand() * 2 - 1) * 4), 0, order.length - 1); [order[i], order[j]] = [order[j], order[i]]; }
+    return ch.map((x, c) => {
+      const parts = [];
+      order.forEach((si, i) => {
+        const s = x.subarray(segs[si][0], segs[si][1]);
+        if (!plan[i]) return parts.push(s);
+        switch (p.mode) {
+          case 0: for (let r = 0; r < R; r++) parts.push(s); break;                       // REPEAT (time-stretch)
+          case 1: parts.push(new Float32Array(s.length)); break;                           // OMIT
+          case 2: parts.push(s.map(v => -v)); break;                                       // INVERT
+          case 3: parts.push(Float32Array.from(s).reverse()); break;                       // REVERSE
+          case 4: { const q = resamp(s, Math.round(s.length / R)); for (let r = 0; r < R; r++) parts.push(q); break; }   // TRANSPOSE (same length)
+          default: parts.push(s);
+        }
+      });
+      prog((c + 1) / ch.length);
+      const o = catF(parts);
+      return o.length > MAXLEN ? o.slice(0, MAXLEN) : o;
+    });
+  },
+  wavg(ch, sr, p, prog) {
+    const segs = wsets(ch, p.group), K = Math.round(p.span);
+    let gpk = 0; for (const x of ch) gpk = Math.max(gpk, peak(x));
+    return ch.map((x, c) => {
+      const out = new Float32Array(x.length);
+      segs.forEach(([a, b], i) => {
+        const L = b - a, s = x.subarray(a, b);
+        if (p.mode === 0) {   // NORMALIZE every cycle to the same peak
+          const pk = peak(s), g = pk > gpk * 0.002 ? 1 + p.amount * (Math.min(10, gpk * 0.8 / pk) - 1) : 1;
+          for (let q = 0; q < L; q++) out[a + q] = s[q] * g;
+          return;
+        }
+        const avg = new Float32Array(L); let n = 0;
+        for (let j = Math.max(0, i - K); j <= Math.min(segs.length - 1, i + K); j++) { const r = resamp(x.subarray(segs[j][0], segs[j][1]), L); for (let q = 0; q < L; q++) avg[q] += r[q]; n++; }
+        for (let q = 0; q < L; q++) { const v = avg[q] / n; out[a + q] = p.mode === 1 ? s[q] + (v - s[q]) * p.amount : s[q] + (s[q] - v) * p.amount * 2; }
+      });
+      prog((c + 1) / ch.length);
+      return out;
+    });
+  },
+  // ===== granular / time =====
+  // BRASSAGE: overlapping grains re-read at a new speed and pitch, with scatter and shuffle
+  brass(ch, sr, p, prog) {
+    const len = ch[0].length, outLen = Math.min(MAXLEN, Math.round(len * p.stretch)), G = Math.max(16, Math.round(p.size / 1000 * sr));
+    const hop = Math.max(4, Math.round(G / p.density)), ratio = Math.pow(2, p.pitch / 12), win = hann(G), gn = 2 / p.density, n = Math.ceil(outLen / hop) + 1;
+    const out = ch.map(() => new Float32Array(outLen)); seed(p.seed);
+    for (let g = 0; g < n; g++) {
+      const t0 = g * hop; let src = t0 / p.stretch + (rand() - 0.5) * p.scatter * G * 4;
+      if (rand() < p.shuffle) src += (rand() - 0.5) * sr * 2;
+      src = clamp(src, 0, len - 1);
+      ch.forEach((x, c) => { const o = out[c]; for (let i = 0; i < G; i++) { const j = t0 - (G >> 1) + i; if (j >= 0 && j < outLen) o[j] += lerpAt(x, src + (i - G / 2) * ratio) * win[i] * gn; } });
+      if (!(g & 127)) prog(g / n);
+    }
+    return out;
+  },
+  // REPEATS: one grain bounces like a ball: intervals shrink (accelerando) or grow, each hit quieter
+  bounce(ch, sr, p, prog) {
+    const len = ch[0].length, a = Math.round(p.pos * (len - 1)), G = Math.max(32, Math.min(len - a, Math.round(p.size / 1000 * sr))), fd = Math.max(2, Math.min(G >> 2, Math.round(0.003 * sr)));
+    const times = []; let t = 0, iv = p.interval / 1000 * sr;
+    for (let i = 0; i < p.count; i++) { times.push(Math.round(t)); t += iv; iv *= p.accel; if (iv < 32 || t > MAXLEN) break; }
+    const gesture = Math.round(times[times.length - 1] + G), outLen = Math.min(MAXLEN, a + gesture + (p.keep ? Math.max(0, len - a - G) : 0));
+    return ch.map(x => {
+      const out = new Float32Array(outLen); out.set(x.subarray(0, Math.min(a, outLen)));
+      times.forEach((tt, n) => { const g = Math.pow(1 - p.decay, n); for (let i = 0; i < G; i++) { const o = a + tt + i; if (o < outLen) out[o] += x[a + i] * g * Math.min(1, (i + fd * (n ? 0 : 1)) / fd, (G - 1 - i) / fd); } });
+      if (p.keep) for (let i = 0, s0 = a + gesture; s0 + i < outLen && a + G + i < len; i++) out[s0 + i] += x[a + G + i];
+      return out;
+    });
+  },
+  // DRUNK: segments read by a random walk (with a slight forward drift) · SCRAMBLE: random segments from anywhere
+  drunk(ch, sr, p, prog) {
+    const len = ch[0].length, S = Math.max(64, Math.round(p.seg / 1000 * sr)), nseg = Math.max(1, Math.floor(len / S)), outLen = Math.min(MAXLEN, Math.round(len * p.lenx)), fd = Math.max(2, Math.min(S >> 2, Math.round(0.004 * sr)));
+    const plan = []; let pos = 0, o = 0; seed(p.seed);
+    while (o < outLen) {
+      if (p.mode === 0) { plan.push([pos * S, S]); pos = clamp(pos + Math.round((rand() * 2 - 1) * p.step + 0.3), 0, nseg - 1); o += S; }
+      else { const L = Math.round(S * (0.5 + rand())); plan.push([Math.floor(rand() * Math.max(1, len - L)), L]); o += L; }
+    }
+    return ch.map(x => {
+      const out = new Float32Array(outLen); let w = 0;
+      for (const [a, L] of plan) { for (let i = 0; i < L && w + i < outLen; i++) out[w + i] = (a + i < len ? x[a + i] : 0) * Math.min(1, i / fd, (L - 1 - i) / fd); w += L; }
+      return out;
+    });
+  },
+  // ITERATE: one tiny segment multiplied hundreds of times with pitch / level / pan scatter: clicks become bowed textures
+  iter(ch, sr, p, prog) {
+    const len = ch[0].length, a = Math.round(p.pos * (len - 1)), G = Math.max(16, Math.min(len - a, Math.round(p.size / 1000 * sr))), outLen = Math.min(MAXLEN, Math.round(p.len * sr));
+    const fd = Math.max(2, Math.min(G >> 2, Math.round(0.002 * sr))), L = new Float32Array(outLen), R = new Float32Array(outLen), xl = ch[0], xr = ch[1] || ch[0];
+    seed(p.seed);
+    for (let t = 0; t < outLen; t += Math.max(1, Math.round(sr / p.density * (0.5 + rand())))) {
+      const ratio = Math.pow(2, (rand() * 2 - 1) * p.pitch / 12), g = 1 - p.gain * rand(), [gl, gr] = panG(0.5 + (rand() - 0.5) * 0.7), n = Math.floor(G / ratio);
+      for (let i = 0; i < n && t + i < outLen; i++) { const e = Math.min(1, i / fd, (n - 1 - i) / fd) * g, sp = a + i * ratio; L[t + i] += lerpAt(xl, sp) * e * gl; R[t + i] += lerpAt(xr, sp) * e * gr; }
+      prog(t / outLen);
+    }
+    fades(L, 0, Math.round(0.05 * sr)); fades(R, 0, Math.round(0.05 * sr));
+    return [L, R];
+  },
+  // ZIGZAG: the read head runs forward and backward between random turning points · SCRUB: tape shuttle on a sine speed curve
+  zig(ch, sr, p, prog) {
+    const len = ch[0].length, outLen = Math.min(MAXLEN, Math.round(len * p.lenx)), span = Math.max(64, p.span * sr), path = new Float64Array(outLen);
+    seed(p.seed);
+    if (p.mode === 1) for (let i = 0; i < outLen; i++) path[i] = clamp((i / outLen) * len + span * 0.5 * Math.sin(TAU * p.rate * i / sr), 0, len - 1);
+    else {
+      const r = len / outLen, bf = r < 1 ? (1 - r) / (1 + r) : 0, spd = Math.max(1, r);
+      let pos = 0, dir = 1, fwd = span * (0.5 + rand()), left = fwd;
+      for (let i = 0; i < outLen; i++) {
+        path[i] = pos; pos = clamp(pos + dir * spd, 0, len - 1); left -= spd;
+        if (left <= 0) { if (dir > 0 && bf > 0) { dir = -1; left = fwd * bf * (0.5 + rand()); } else { dir = 1; fwd = span * (0.5 + rand()); left = fwd; } }
+      }
+    }
+    return ch.map(x => { const out = new Float32Array(outLen); for (let i = 0; i < outLen; i++) out[i] = lerpAt(x, path[i]); fades(out, Math.round(0.003 * sr), Math.round(0.01 * sr)); return out; });
+  },
+  // ===== texture =====
+  // TEXTURE: the whole (short) source scattered over time, pitch and stereo: random cloud, rhythmic grid or chord tones
+  tex(ch, sr, p, prog) {
+    const len = Math.min(ch[0].length, 4 * sr), outLen = Math.min(MAXLEN, Math.round(p.len * sr)), n = Math.max(1, Math.round(p.density * outLen / sr));
+    const L = new Float32Array(outLen), R = new Float32Array(outLen), xl = ch[0], xr = ch[1] || ch[0], fd = Math.round(0.004 * sr);
+    let chord = [0, 4, 7, 11, 12, 14, 16, 19, -5, -8, -12].filter(s => Math.abs(s) <= p.pitch); if (!chord.length) chord = [0];
+    seed(p.seed);
+    for (let e = 0; e < n; e++) {
+      const t = p.mode === 1 ? Math.round(e * sr / p.density) : Math.floor(rand() * outLen);
+      if (p.mode === 1 && e % 4 && rand() < 0.35) continue;   // rhythmic gaps, downbeats always play
+      const st = p.mode === 2 ? chord[Math.floor(rand() * chord.length)] : (rand() * 2 - 1) * p.pitch, ratio = Math.pow(2, st / 12);
+      const g = (p.mode === 1 ? (e % 4 ? 0.6 : 1) : 0.4 + rand() * 0.6), [gl, gr] = panG(0.5 + (rand() - 0.5) * p.width), m = Math.floor(len / ratio);
+      for (let i = 0; i < m && t + i < outLen; i++) { const k = Math.min(1, (m - 1 - i) / fd) * g, sp = i * ratio; L[t + i] += lerpAt(xl, sp) * k * gl; R[t + i] += lerpAt(xr, sp) * k * gr; }
+      if (!(e & 15)) prog(e / n);
+    }
+    return [L, R];
+  },
+  // SHRINK: a segment repeats, each copy shorter (accelerating cascade) · POLY: voices loop it at 3:4:5:6:7 across the stereo field
+  seg(ch, sr, p, prog) {
+    const len = ch[0].length, a = Math.round(p.pos * (len - 1)), S = Math.max(64, Math.min(len - a, Math.round(p.size / 1000 * sr))), fd = Math.max(2, Math.min(S >> 3, Math.round(0.003 * sr)));
+    const ev = [];
+    if (p.mode === 0) { let t = 0, L = S; for (let i = 0; i < p.reps && L >= 32; i++) { ev.push([t, L, 0.5]); t += L; L = Math.round(L * p.shrink); } }
+    else { const T = S * p.reps; for (let v = 0; v < p.voices; v++) { const per = Math.round(S * 3 / (v + 3)), pan = 0.15 + 0.7 * v / (p.voices - 1); for (let t = 0; t < T; t += per) ev.push([t, per, pan]); } }
+    const outLen = Math.min(MAXLEN, ev.reduce((m, e) => Math.max(m, e[0] + e[1]), 0)), L = new Float32Array(outLen), R = new Float32Array(outLen), xl = ch[0], xr = ch[1] || ch[0];
+    for (const [t, n, pan] of ev) {
+      const [gl, gr] = panG(pan);
+      for (let i = 0; i < n && t + i < outLen; i++) { const e = Math.min(1, i / fd, (n - 1 - i) / fd), j = a + i; if (j >= len) break; L[t + i] += xl[j] * e * gl; R[t + i] += xr[j] * e * gr; }
+    }
+    return [L, R];
+  },
+  // ===== formant / pitch / space =====
+  // PITCH: phase-vocoder transposition, then the original spectral envelope (formants) is put back
+  fpitch(ch, sr, p, prog) {
+    const len = ch[0].length, ratio = Math.pow(2, p.semis / 12);
+    return stftRun(ch, sr, p.win, prog, len + pow2(p.win * sr), (mag, ph, st) => {
+      const { half, N } = st, B = 250 / (sr / N);
+      if (!st.e1) { st.e1 = new Float64Array(half + 1); st.e2 = new Float64Array(half + 1); }
+      envelope(mag, B, st.e1);
+      pvMap(mag, ph, st, tf => tf * ratio);
+      envelope(mag, B, st.e2);
+      for (let k = 0; k <= half; k++) mag[k] *= Math.pow(Math.min(30, st.e1[k] / st.e2[k]), p.preserve);
+    });
+  },
+  // FORMANT WARP: pitch stays, the envelope is shifted, squeezed around a centre or mirrored
+  fwarp(ch, sr, p, prog) {
+    const len = ch[0].length;
+    return stftRun(ch, sr, 0.05, prog, len + pow2(0.05 * sr), (mag, ph, st) => {
+      const { half, N } = st, bin = sr / N, cb = p.center / bin;
+      if (!st.e) st.e = new Float64Array(half + 1);
+      const env = envelope(mag, p.detail / bin, st.e);
+      const at = x => { if (x <= 0) return env[0]; if (x >= half) return env[half]; const i = Math.floor(x), f = x - i; return env[i] + (env[i + 1] - env[i]) * f; };
+      for (let k = 1; k <= half; k++) mag[k] = mag[k] / env[k] * at(p.mode === 0 ? k / p.amount : p.mode === 1 ? cb + (k - cb) * p.amount : cb * cb / k);
+    });
+  },
+  // SPATIAL: the sound travels around the listener (circle / spiral / Lissajous / hover / fly-by) with level, delay (Doppler),
+  // interaural time difference and air/head-shadow filtering, rendered to stereo
+  space(ch, sr, p, prog) {
+    const len = ch[0].length, outLen = Math.min(MAXLEN, len + Math.round(0.12 * sr)), dur = outLen / sr;
+    const m = new Float32Array(len); for (const x of ch) for (let i = 0; i < len; i++) m[i] += x[i] / ch.length;
+    const L = new Float32Array(outLen), R = new Float32Array(outLen);
+    let hx = 0, hy = 1, vx = 0, vy = 0, lpL = 0, lpR = 0, x = 0, y = 1;
+    const lim = 1 + p.depth * 2; seed(p.seed);
+    for (let i = 0; i < outLen; i++) {
+      const t = i / sr, a = TAU * p.rate * t;
+      switch (p.mode) {
+        case 0: x = lim * Math.sin(a); y = lim * Math.cos(a); break;
+        case 1: { const r = 0.4 + p.depth * 4 * t / dur; x = r * Math.sin(a); y = r * Math.cos(a); break; }
+        case 2: x = lim * Math.sin(a * 3); y = lim * Math.sin(a * 2 + 0.5); break;
+        case 3: if (!(i & 255)) { vx = (vx + (rand() - 0.5) * 0.02 * p.rate) * 0.97; vy = (vy + (rand() - 0.5) * 0.02 * p.rate) * 0.97; hx = clamp(hx + vx, -lim, lim); hy = clamp(hy + vy, -lim, lim); } x = hx; y = hy; break;
+        default: x = -5 + 10 * t / dur; y = 0.3 + p.depth * 2;
+      }
+      const d = Math.max(0.3, Math.hypot(x, y)), pan = clamp(x / d, -1, 1), gl = Math.sqrt((1 - pan) / 2), gr = Math.sqrt((1 + pan) / 2), att = 1 / (0.5 + d);
+      const dop = p.doppler * d * 0.015 * sr, sL = lerpAt(m, i - dop - Math.max(0, pan) * 0.0006 * sr), sR = lerpAt(m, i - dop - Math.max(0, -pan) * 0.0006 * sr);
+      const k = Math.exp(-d * 0.15) * (y < 0 ? 0.6 : 1);
+      lpL += (sL - lpL) * k; lpR += (sR - lpR) * k;
+      L[i] = lpL * gl * att; R[i] = lpR * gr * att;
+      if (!(i & 65535)) prog(i / outLen);
+    }
+    return [L, R];
   },
 };
 onmessage = e => {
@@ -5485,7 +5839,7 @@ const LAB_PROCS = [
   { id: 'paul', name: 'PAULSTRETCH', tag: 'PSTR', desc: 'Extreme time stretch with smeared phases: any sound becomes a slow, glassy ambient cloud.',
     params: [P('stretch', 'STRETCH', 1.5, 50, 8, { exp: 1, unit: 'x' }), P('win', 'WINDOW', 0.02, 1, 0.25, { exp: 1, fmt: 'time' }), seedP] },
   { id: 'freeze', name: 'SPECTRAL FREEZE', tag: 'FRZ', desc: 'Grabs one instant of the sound and holds it as an endless drone. SHIMMER makes the frozen partials flutter.',
-    params: [pctP('pos', 'POSITION', 0.3), P('len', 'LENGTH', 1, 60, 10, { unit: 's' }), pctP('shimmer', 'SHIMMER', 0.3), seedP] },
+    params: [pctP('pos', 'POSITION', 0.3), P('len', 'LENGTH', 1, 60, 10, { unit: 's' }), pctP('shimmer', 'SHIMMER', 0.3), pctP('scan', 'SCAN', 0), seedP] },
   { id: 'blur', name: 'SPECTRAL BLUR', tag: 'BLUR', desc: 'Smears the spectrum over time: attacks melt, notes bleed into washes. DIFFUSE scrambles the phases.',
     params: [pctP('amount', 'AMOUNT', 0.7), pctP('diffuse', 'DIFFUSE', 0.3), P('win', 'WINDOW', 0.02, 0.5, 0.09, { exp: 1, fmt: 'time' }), seedP] },
   { id: 'shift', name: 'SPECTRAL SHIFT', tag: 'SHFT', desc: 'Phase-vocoder frequency shift (breaks harmonics: bells, metal, alien voices). SPREAD stretches the whole spectrum.',
@@ -5505,19 +5859,71 @@ const LAB_PROCS = [
     params: [P('size', 'SIZE', 0.3, 8, 2.5, { exp: 1, fmt: 'time' }), pctP('damp', 'DAMP', 0.5), pctP('mix', 'MIX', 0.6), seedP] },
   { id: 'shuffle', name: 'SLICE SHUFFLE', tag: 'SHUF', desc: 'Cuts the sample into equal slices and plays them back in a random order (breakbeat mangling).',
     params: [P('slices', 'SLICES', 2, 64, 8, { int: 1 }), pctP('rev', 'REVERSE', 0.15), P('keep', 'KEEP 1ST', 0, 1, 1, { options: ['NO', 'YES'] }), seedP] },
-  { id: 'conv', name: 'CONVOLVE', tag: 'CONV', desc: 'Plays the source "through" another sample (its impulse): cross-synthesis of two sounds. Try a vocal through a cymbal.',
-    params: [/* IMPULSE: built per render (list of samples) */ pctP('mix', 'MIX', 0.7)] },
+  { id: 'conv', name: 'CONVOLVE', tag: 'CONV', aux: 'IMPULSE', desc: 'Plays the source "through" another sample (its impulse): cross-synthesis of two sounds. Try a vocal through a cymbal.',
+    params: [pctP('mix', 'MIX', 0.7)] },
+  // ---- spectral ----
+  { id: 'morph', name: 'MORPH / VOCODE', tag: 'MRPH', aux: 'MODULATOR', desc: 'Blends the spectra of two sounds. MORPH mixes them by AMOUNT, GLIDE turns the source into the modulator over the length, VOCODE imposes the modulator\'s spectral envelope and formants on the source (DETAIL = envelope resolution).',
+    params: [P('mode', 'MODE', 0, 2, 1, { options: ['MORPH', 'GLIDE A→B', 'VOCODE'] }), pctP('amount', 'AMOUNT', 0.5), P('detail', 'DETAIL', 50, 1000, 250, { exp: 1, fmt: 'hz' }), P('win', 'WINDOW', 0.02, 0.3, 0.09, { exp: 1, fmt: 'time' })] },
+  { id: 'tune', name: 'SPEC TUNE', tag: 'TUNE', desc: 'Forces noise, field recordings or speech onto a pitch template: a scale, a chord, quarter tones or a harmonic series. PROGRESSION steps the root through a chord sequence over time.',
+    params: [P('note', 'ROOT', 24, 72, 48, { int: 1, fmt: 'note' }), P('scale', 'TEMPLATE', 0, 8, 5, { options: ['CHROMATIC', 'MAJOR', 'MINOR', 'PENTATONIC', 'WHOLE TONE', 'MAJ7 CHORD', 'MIN9 CHORD', 'QUARTER TONES', 'HARMONICS'] }),
+      P('prog', 'PROGRESSION', 0, 4, 0, { options: ['STATIC', 'I-IV-V-I', 'i-VI-III-VII', 'RISING', 'FALLING'] }), P('width', 'FOCUS', 5, 100, 25, { unit: 'ct' }), pctP('amount', 'STRENGTH', 0.9)] },
+  { id: 'sinv', name: 'STRETCH / INVERT', tag: 'SINV', desc: 'STRETCH pulls the partials away from their harmonic positions (exponent around CENTER). INVERT mirrors the whole spectrum around CENTER: lows become highs. Eerie, alien, bell-like.',
+    params: [P('mode', 'MODE', 0, 2, 0, { options: ['STRETCH', 'INVERT', 'BOTH'] }), P('stretch', 'STRETCH', 0.5, 2, 1.25, { unit: 'x' }), P('center', 'CENTER', 50, 5000, 500, { exp: 1, fmt: 'hz' }), P('win', 'WINDOW', 0.02, 0.3, 0.09, { exp: 1, fmt: 'time' })] },
+  { id: 'focus', name: 'FOCUS / RESON', tag: 'FOCS', desc: 'Keeps only the strongest spectral peaks and damps everything around them: singing resonances and bell tones pulled out of wind, water or noise. RING lets the peaks sustain.',
+    params: [P('peaks', 'PEAKS', 1, 64, 8, { int: 1 }), P('width', 'WIDTH', 0, 4, 1, { int: 1 }), pctP('depth', 'DEPTH', 0.95), P('ring', 'RING', 0, 8, 1.5, { fmt: 'time' }), P('win', 'WINDOW', 0.02, 0.3, 0.09, { exp: 1, fmt: 'time' })] },
+  { id: 'mask', name: 'MASK / SUPPRESS', tag: 'MASK', aux: 'MASK', desc: 'MASK SAMPLE filters the source against the spectrum of another sample. STRIP PEAKS removes the strongest partials (fundamentals). TRANSIENTS keeps only onsets, SUSTAIN only the steady part.',
+    params: [P('mode', 'MODE', 0, 3, 1, { options: ['MASK SAMPLE', 'STRIP PEAKS', 'TRANSIENTS', 'SUSTAIN'] }), pctP('amount', 'AMOUNT', 0.8), P('win', 'WINDOW', 0.02, 0.3, 0.05, { exp: 1, fmt: 'time' })] },
+  // ---- waveset ----
+  { id: 'wdist', name: 'WAVESET DISTORT', tag: 'WDST', desc: 'Works on single wave cycles (between zero crossings), GROUP at a time: REPEAT (stretches), OMIT, INVERT, REVERSE, TRANSPOSE (FACTOR x up, same length) or SHUFFLE, for CHANCE of the cycles. From warm grit to total destruction.',
+    params: [P('mode', 'MODE', 0, 5, 0, { options: ['REPEAT', 'OMIT', 'INVERT', 'REVERSE', 'TRANSPOSE', 'SHUFFLE'] }), P('group', 'GROUP', 1, 16, 2, { int: 1 }), P('amt', 'FACTOR', 2, 8, 2, { int: 1 }), pctP('chance', 'CHANCE', 0.5), seedP] },
+  { id: 'wavg', name: 'WAVESET AVERAGE', tag: 'WAVG', desc: 'Reshapes every wave cycle while the pitch stays intact: NORMALIZE gives all cycles the same level, AVERAGE smooths each cycle toward its SPAN neighbours, ACCENT exaggerates their differences.',
+    params: [P('mode', 'MODE', 0, 2, 1, { options: ['NORMALIZE', 'AVERAGE', 'ACCENT'] }), pctP('amount', 'AMOUNT', 0.7), P('span', 'SPAN', 1, 8, 3, { int: 1 }), P('group', 'GROUP', 1, 8, 1, { int: 1 })] },
+  // ---- granular / time ----
+  { id: 'brass', name: 'BRASSAGE', tag: 'BRAS', desc: 'Classic multi-purpose granulator: independent time STRETCH and PITCH, grain size, DENSITY (overlap), SCATTER of the read position and SHUFFLE (grains jump to other places).',
+    params: [P('stretch', 'STRETCH', 0.25, 8, 2, { exp: 1, unit: 'x' }), P('pitch', 'PITCH', -24, 24, 0, { unit: 'st' }), P('size', 'GRAIN', 10, 300, 60, { exp: 1, unit: 'ms' }),
+      P('density', 'DENSITY', 1, 8, 4), pctP('scatter', 'SCATTER', 0.2), pctP('shuffle', 'SHUFFLE', 0), seedP] },
+  { id: 'bounce', name: 'REPEATS / BOUNCE', tag: 'BNCE', desc: 'Grabs one grain at POSITION and repeats it with shrinking (ACCEL < 1: bouncing ball) or growing (> 1: slowing echo) intervals, each hit DECAY quieter. KEEP REST continues with the rest of the sample.',
+    params: [pctP('pos', 'POSITION', 0), P('size', 'GRAIN', 10, 1000, 120, { exp: 1, unit: 'ms' }), P('count', 'COUNT', 2, 64, 14, { int: 1 }), P('interval', 'INTERVAL', 20, 2000, 400, { exp: 1, unit: 'ms' }),
+      P('accel', 'ACCEL', 0.5, 1.5, 0.8, { unit: 'x' }), pctP('decay', 'DECAY', 0.1), P('keep', 'KEEP REST', 0, 1, 0, { options: ['NO', 'YES'] })] },
+  { id: 'drunk', name: 'DRUNK / SCRAMBLE', tag: 'DRNK', desc: 'DRUNK WALK reads SEGMENTs by a random walk (up to STEP segments per move, slowly drifting forward). SCRAMBLE plays random segments of random length from anywhere.',
+    params: [P('mode', 'MODE', 0, 1, 0, { options: ['DRUNK WALK', 'SCRAMBLE'] }), P('seg', 'SEGMENT', 20, 1000, 120, { exp: 1, unit: 'ms' }), P('step', 'STEP', 1, 16, 3, { int: 1 }), P('lenx', 'LENGTH', 0.5, 4, 1, { unit: 'x' }), seedP] },
+  { id: 'iter', name: 'ITERATE', tag: 'ITER', desc: 'Takes one tiny segment (a click, a transient) and multiplies it DENSITY times per second with pitch, level and stereo scatter: clicks turn into bowed friction, buzzing or harmonic clouds.',
+    params: [pctP('pos', 'POSITION', 0), P('size', 'GRAIN', 5, 500, 40, { exp: 1, unit: 'ms' }), P('len', 'LENGTH', 1, 30, 6, { unit: 's' }), P('density', 'DENSITY', 5, 300, 40, { exp: 1, unit: '/s' }),
+      P('pitch', 'PITCH ±', 0, 12, 1, { unit: 'st' }), pctP('gain', 'LEVEL ±', 0.5), seedP] },
+  { id: 'zig', name: 'ZIGZAG / SCRUB', tag: 'ZIGZ', desc: 'ZIGZAG runs the read head forward and backward between random turning points about SPAN apart. SCRUB shuttles it on a sine speed curve at SCRUB RATE, like rocking a tape reel.',
+    params: [P('mode', 'MODE', 0, 1, 0, { options: ['ZIGZAG', 'SCRUB'] }), P('span', 'SPAN', 0.02, 2, 0.3, { exp: 1, fmt: 'time' }), P('rate', 'SCRUB RATE', 0.1, 20, 2, { exp: 1, unit: 'Hz' }), P('lenx', 'LENGTH', 0.5, 4, 1.5, { unit: 'x' }), seedP] },
+  // ---- texture ----
+  { id: 'tex', name: 'TEXTURE', tag: 'TEXT', desc: 'Scatters the whole (short) source over time, pitch and stereo: a random CLOUD, a RHYTHM grid (DENSITY hits per second) or CHORD tones within the PITCH range.',
+    params: [P('mode', 'MODE', 0, 2, 0, { options: ['CLOUD', 'RHYTHM', 'CHORD'] }), P('len', 'LENGTH', 1, 60, 10, { unit: 's' }), P('density', 'DENSITY', 1, 50, 8, { exp: 1, unit: '/s' }),
+      P('pitch', 'PITCH ±', 0, 24, 7, { unit: 'st' }), pctP('width', 'WIDTH', 0.8), seedP] },
+  { id: 'seg', name: 'SHRINK / POLY', tag: 'SEGM', desc: 'SHRINK repeats a segment, each copy shorter by SHRINK: an accelerating cascade. POLYRHYTHM loops it in several VOICES at 3:4:5:6:7 spread across the stereo field.',
+    params: [P('mode', 'MODE', 0, 1, 0, { options: ['SHRINK', 'POLYRHYTHM'] }), pctP('pos', 'POSITION', 0), P('size', 'SEGMENT', 30, 2000, 300, { exp: 1, unit: 'ms' }), P('reps', 'REPEATS', 2, 32, 12, { int: 1 }),
+      P('shrink', 'SHRINK', 0.5, 0.98, 0.8, { unit: 'x' }), P('voices', 'VOICES', 2, 5, 3, { int: 1 })] },
+  // ---- formant / pitch / space ----
+  { id: 'fpitch', name: 'FORMANT PITCH', tag: 'FPIT', desc: 'Transposes up to two octaves while keeping the resonance peaks (formants) in place, so voices and instruments keep their natural character. PRESERVE 0% = plain pitch shift.',
+    params: [P('semis', 'PITCH', -24, 24, 7, { int: 1, unit: 'st' }), pctP('preserve', 'PRESERVE', 1), P('win', 'WINDOW', 0.02, 0.2, 0.06, { exp: 1, fmt: 'time' })] },
+  { id: 'fwarp', name: 'FORMANT WARP', tag: 'FWRP', desc: 'Moves the formants without touching the pitch: SHIFT them up/down, SQUEEZE them around CENTER, or INVERT them (mirror around CENTER). DETAIL = envelope smoothness.',
+    params: [P('mode', 'MODE', 0, 2, 0, { options: ['SHIFT', 'SQUEEZE', 'INVERT'] }), P('amount', 'AMOUNT', 0.5, 2, 1.3, { unit: 'x' }), P('center', 'CENTER', 200, 4000, 1000, { exp: 1, fmt: 'hz' }), P('detail', 'DETAIL', 100, 800, 300, { exp: 1, fmt: 'hz' })] },
+  { id: 'space', name: 'SPATIAL / HOVER', tag: 'SPAC', desc: 'Flies the sound around the listener in stereo: CIRCLE, SPIRAL (outward), LISSAJOUS, HOVER (random drifting) or FLY-BY, with distance, head shadow and DOPPLER pitch shift.',
+    params: [P('mode', 'PATH', 0, 4, 0, { options: ['CIRCLE', 'SPIRAL', 'LISSAJOUS', 'HOVER', 'FLY-BY'] }), P('rate', 'RATE', 0.02, 5, 0.3, { exp: 1, unit: 'Hz' }), pctP('depth', 'DISTANCE', 0.5), pctP('doppler', 'DOPPLER', 0.5), seedP] },
   { id: 'gate', name: 'SPECTRAL GATE', tag: 'SGAT', desc: 'Keeps only the loudest partials (crystalline tones) or only what hides beneath them (ghostly residue).',
     params: [P('thr', 'THRESH', -60, 0, -20, { fmt: 'db' }), P('mode', 'KEEP', 0, 1, 0, { options: ['LOUD', 'QUIET'] }), P('win', 'WINDOW', 0.02, 0.3, 0.09, { exp: 1, fmt: 'time' })] },
   { id: 'reso', name: 'RESONATOR', tag: 'RESO', desc: 'A bank of tuned strings that ring along with the sound: turns noise and drums into chords.',
     params: [P('note', 'NOTE', 24, 84, 45, { int: 1, fmt: 'note' }), P('chord', 'CHORD', 0, 7, 3, { options: ['ROOT', 'OCTAVE', 'FIFTH', 'MAJOR', 'MINOR', 'SUS4', 'DOM7', 'CLUSTER'] }),
       P('decay', 'DECAY', 0.1, 10, 2, { exp: 1, fmt: 'time' }), pctP('bright', 'BRIGHT', 0.5), pctP('mix', 'MIX', 0.6)] },
 ];
+const LAB_CATS = [
+  ['SPECTRAL', ['freeze', 'blur', 'morph', 'tune', 'sinv', 'shift', 'focus', 'mask', 'gate', 'conv']],
+  ['WAVESET', ['wdist', 'wavg', 'bits']],
+  ['GRANULAR · TIME', ['brass', 'paul', 'grain', 'bounce', 'drunk', 'iter', 'zig', 'stutter', 'shuffle', 'tape']],
+  ['TEXTURE', ['tex', 'seg', 'reso', 'revrev']],
+  ['FORMANT · PITCH · SPACE', ['fpitch', 'fwarp', 'robot', 'space']],
+];
 const LAB_COMMON = [P('norm', 'NORMALIZE', 0, 1, 1, { options: ['OFF', 'ON'] }), P('dest', 'KEEP INTO', 0, 1, 0, { options: ['NEW INSTR', 'SOURCE INSTR'] })];
 const lab = { proc: 'paul', src: 0, vals: {}, norm: 1, dest: 0, chain: null, result: null, busy: false, worker: null, job: 0, playing: null, from: 'pattern' };
 const labProc = () => LAB_PROCS.find(x => x.id === lab.proc);
 function labVals(id = lab.proc) {
-  if (!lab.vals[id]) { lab.vals[id] = defaultsOf(LAB_PROCS.find(x => x.id === id).params); if (id === 'conv') lab.vals[id].ir = 0; }
+  if (!lab.vals[id]) { const pr = LAB_PROCS.find(x => x.id === id); lab.vals[id] = defaultsOf(pr.params); if (pr.aux) lab.vals[id].ir = 0; }
   return lab.vals[id];
 }
 const labSamples = () => { const l = []; for (let i = 1; i <= MAX_INST; i++) { const x = song.instruments[i]; if (x.type === 'sampler' && instSample(x)) l.push(i); } return l; };
@@ -5537,7 +5943,11 @@ function buildLab() {
   ui.labSrcInfo = el('span', { class: 'fnote' });
   ui.labPlaySrc = btn('▶ SOURCE', () => labPlay('src'), 'amber');
   ui.labProcs = el('div', { class: 'labprocs' });
-  for (const pr of LAB_PROCS) { const b = btn(pr.name, () => { lab.proc = pr.id; renderLabParams(); refreshLab(); }); b.dataset.id = pr.id; ui.labProcs.append(b); }
+  for (const [cat, ids] of LAB_CATS) {
+    const bs = el('div', { class: 'labbtns' });
+    for (const id of ids) { const pr = LAB_PROCS.find(x => x.id === id); const b = btn(pr.name, () => { lab.proc = pr.id; renderLabParams(); refreshLab(); }); b.dataset.id = pr.id; bs.append(b); }
+    ui.labProcs.append(el('div', { class: 'labcat' }, el('span', { text: cat }), bs));
+  }
   ui.labDesc = el('span', { class: 'fnote labdesc' });
   ui.labGrid = el('div', { class: 'rsgrid' });
   ui.labGo = btn('⚗ PROCESS', labRun, 'lab big');
@@ -5564,10 +5974,10 @@ function renderLabParams() {
   const pr = labProc(), v = labVals(), grid = ui.labGrid; grid.innerHTML = ''; ui.labBoxes = [];
   const bind = { noHist: true, sliderOnly: true, target: () => ({ obj: {}, apply() { } }), obj: () => v, set: (k, x) => { v[k] = x; } };
   const add = (pd, b) => { const pb = new ParamBox(pd, b); ui.labBoxes.push(pb); grid.append(pb.el); };
-  if (pr.id === 'conv') {   // impulse = any sample in the song
+  if (pr.aux) {   // second sound (impulse / modulator / mask) = any sample in the song
     const l = labSamples(), names = l.length ? l.map(i => hex(i) + ' ' + (song.instruments[i].name || 'SAMPLE')) : ['(no samples)'];
     if (!l.includes(v.ir)) v.ir = l.find(i => i !== lab.src) || l[0] || 0;
-    add(P('ir', 'IMPULSE', 0, names.length - 1, 0, { options: names }),
+    add(P('ir', pr.aux, 0, names.length - 1, 0, { options: names }),
       { noHist: true, sliderOnly: true, target: () => ({ obj: {}, apply() { } }), obj: () => ({ ir: Math.max(0, l.indexOf(v.ir)) }), set: (k, x) => { v.ir = l[x] || 0; } });
   }
   for (const pd of pr.params) add(pd, bind);
@@ -5602,7 +6012,7 @@ function refreshLab(enter) {
   ui.labSrc.textContent = lab.chain ? '⟲ ' + lab.chain.name : lab.src ? hex(lab.src) + ' ' + (song.instruments[lab.src].name || 'SAMPLE') : '(no sample)';
   ui.labSrcInfo.textContent = !src ? 'Load a sample into a SAMPLER instrument first (INST tab).'
     : (src.ch[0].length / src.sr).toFixed(2) + 's · ' + (src.ch.length > 1 ? 'stereo' : 'mono') + ' · ' + src.sr + ' Hz' + (lab.chain ? ' · chained result' : src.region ? ' · between the start/end markers' : '');
-  [...ui.labProcs.children].forEach(b => b.classList.toggle('on', b.dataset.id === lab.proc));
+  ui.labProcs.querySelectorAll('.btn').forEach(b => b.classList.toggle('on', b.dataset.id === lab.proc));
   ui.labDesc.textContent = pr.desc;
   ui.labBoxes.forEach(b => b.refresh());
   ui.labGo.classList.toggle('dis', !src || lab.busy);
@@ -5622,9 +6032,9 @@ function labRun() {
   const src = labSource(); if (!src) return toast('No source sample');
   const pr = labProc(), p = Object.assign({}, labVals());
   let aux = null;
-  if (pr.id === 'conv') {
+  if (pr.aux && !(pr.id === 'mask' && p.mode !== 0)) {
     const ins = song.instruments[p.ir], s = ins && instSample(ins);
-    if (!s) return toast('Choose an IMPULSE sample');
+    if (!s) return toast('Choose a ' + pr.aux + ' sample');
     aux = s.ch.map(c => c.slice());
   }
   labStop();
@@ -5930,9 +6340,13 @@ $('#helptext').innerHTML = `<b>MOBTRACK — quick reference</b>   (tap anywhere 
  into a sample: TAIL keeps release/echo (0 = exact loop length), NORMALIZE, AUTO WARP (stays in tempo), LOOP,
  PUT INTO a new or the current instrument. PLAY previews it, EDIT IN INST opens it. UNDO removes it.
 
-<b>SAMPLE LAB</b>  (⚗ button in the pattern EDIT tools) offline, non-live sample mangling: PAULSTRETCH, SPECTRAL
- FREEZE / BLUR / SHIFT / GATE, ROBOT / WHISPER, GRANULAR CLOUD, STUTTER / GLITCH, TAPE STOP, BIT MANGLER, REVERSE
- REVERB, SLICE SHUFFLE, CONVOLVE (with another sample), RESONATOR. Works on the sample between its S/E markers.
+<b>SAMPLE LAB</b>  (⚗ button in the pattern EDIT tools) offline, non-live sample mangling, 31 processes:
+ SPECTRAL: FREEZE (SCAN glides it), BLUR, MORPH / VOCODE (2 sounds), SPEC TUNE (pitch templates), STRETCH / INVERT,
+   SHIFT, FOCUS / RESON, MASK / SUPPRESS, GATE, CONVOLVE.  WAVESET: DISTORT (repeat/omit/invert/reverse/transpose/
+   shuffle cycles), AVERAGE (normalize/average/accent), BIT MANGLER.  GRANULAR · TIME: BRASSAGE, PAULSTRETCH, GRANULAR
+   CLOUD, REPEATS / BOUNCE, DRUNK / SCRAMBLE, ITERATE, ZIGZAG / SCRUB, STUTTER, SLICE SHUFFLE, TAPE STOP.
+ TEXTURE: TEXTURE, SHRINK / POLY, RESONATOR, REVERSE REVERB.  FORMANT · PITCH · SPACE: FORMANT PITCH, FORMANT WARP,
+   ROBOT / WHISPER, SPATIAL / HOVER (stereo).  Works on the sample between its S/E markers.
  PROCESS renders in the background → ▶ RESULT to listen → ✓ KEEP makes it an instrument (undoable);
  ⟲ CHAIN uses the result as the next source, to stack processes.
 
