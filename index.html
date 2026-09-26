@@ -8,7 +8,7 @@
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" type="image/png" href="icon-192.png">
 <link rel="apple-touch-icon" href="icon-192.png">
-<title>MOBTRACK</title>
+<title>DATTRACK</title>
 <style>
 :root{
   --bg:#050807;--panel:#0d1311;--panel2:#141c19;--line:#24312c;--text:#cfe6d8;--dim:#5d7268;
@@ -282,7 +282,7 @@ main{flex:1;min-height:0;position:relative}
 <div id="toast"></div>
 <input type="file" id="file" accept="audio/*,.wav,.mp3,.ogg,.flac" hidden>
 <div class="overlay" id="start">
-  <h1>MOBTRACK</h1>
+  <h1>DATTRACK</h1>
   <p>8-track sample tracker &middot; Web Audio / AudioWorklet</p>
   <div class="btn on" id="startbtn">TAP TO START</div>
   <div class="btn" id="restorebtn" hidden>RESTORE LAST SESSION</div>
@@ -432,13 +432,13 @@ class SamplerVoice {
     this.pos = st + clamp(sf, 0, 0.999) * (en - st);
     this.amp.set(p.ampA, p.ampD, p.ampS, p.ampR); this.amp.gate();
     this.fenv.set(p.fltA, p.fltD, p.fltS, p.fltR); this.fenv.gate();
-    // WARP (1 BEATS / 2 MPC): this.pos becomes a timeline that moves at tempo speed; grains replay it at the pitch rate
+    // WARP (1 BEATS / 2 MMC): this.pos becomes a timeline that moves at tempo speed; grains replay it at the pitch rate
     this.eng = eng;
     const wm = p.warp | 0;   // 3 = RE-PITCH: plain playback, speed follows tempo (see control)
     this.warp = this.slice ? 0 : (wm === 1 || wm === 2 ? wm : 0);
     if (this.warp) { this.gA = { pos: 0, age: 0, len: 1, on: false }; this.gB = { pos: 0, age: 0, len: 1, on: false }; this.gc = 0; this.useB = false; this.firstGrain = true; this.ending = false; }
   }
-  // one grain: BEATS = Hann window, 50% overlap (smooth); MPC = flat chunk with 2ms edges (gritty, stuttery)
+  // one grain: BEATS = Hann window, 50% overlap (smooth); MMC = flat chunk with 2ms edges (gritty, stuttery)
   grain(g, dL, dR, len, ip) {
     if (!g.on) return;
     const a = g.age / g.len;
@@ -2304,7 +2304,7 @@ const SAMPLER_PAGES = [
     P('xfade', 'XFADE', 0, 'len', 0, { int: 1, fmt: 'frames' }),
   ] },
   { name: 'WARP', params: [
-    P('warp', 'WARP', 0, 3, 0, { options: ['OFF', 'BEATS', 'MPC', 'RE-PITCH'] }),
+    P('warp', 'WARP', 0, 3, 0, { options: ['OFF', 'BEATS', 'MMC', 'RE-PITCH'] }),
     P('warpBeats', 'BEATS', 0.25, 64, 4, { exp: 1, stepv: 0.25, fmt: 'beats' }),
     P('grain', 'GRAIN', 8, 250, 50, { exp: 1, int: 1, unit: 'ms' }),
   ] },
@@ -2688,7 +2688,7 @@ function unb64(str, T) { const bin = atob(str), u8 = new Uint8Array(bin.length);
 function songToObj(raw) {
   const enc = raw ? (a => a) : b64, s = song;
   return {
-    format: 'mobtrack', version: 3, title: s.title, bpm: s.bpm, speed: s.speed, order: s.order.slice(),
+    format: 'mobtrack', version: 3,   // internal format tag (kept from the app's first name so all old projects still open) title: s.title, bpm: s.bpm, speed: s.speed, order: s.order.slice(),
     patterns: s.patterns.map(p => ({ rows: p.rows, data: enc(p.data) })),
     instruments: s.instruments.slice(1).map(i => ({ type: i.type, name: i.name, preset: i.preset || '', sampleId: i.sampleId, slices: i.slices.slice(), p: Object.assign({}, i.p) })),
     samples: [...s.samples.values()].filter(x => s.instruments.some(i => i && i.sampleId === x.id)).map(x => ({ id: x.id, sr: x.sr, name: x.name, ch: x.ch.map(enc) })),
@@ -2696,7 +2696,7 @@ function songToObj(raw) {
   };
 }
 function songFromObj(o) {
-  if (!o || o.format !== 'mobtrack') throw new Error('Not a MOBTRACK project file');
+  if (!o || o.format !== 'mobtrack') throw new Error('Not a DATTRACK project file');
   const dec = (v, T) => typeof v === 'string' ? unb64(v, T) : new T(v);
   const s = new Song();
   s.title = String(o.title || 'UNTITLED').slice(0, 20); s.bpm = clamp(o.bpm | 0 || 125, 32, 255); s.speed = clamp(o.speed | 0 || 6, 1, 31);
@@ -4071,7 +4071,7 @@ function infoBox(info) {
     line += info.slice ? 'SLICE ' + info.slice + ' / ' + info.slices : info.noSlice ? 'no slice on this key' : 'SAMPLE ' + (info.s.name || '');
     if (!info.noSlice) line += '   ' + (info.a / info.s.sr).toFixed(3) + '–' + (info.b / info.s.sr).toFixed(3) + ' s';
     const w = I.p.warp | 0;
-    if (w) line += '   ' + ['', 'WARP', 'MPC', 'RE-PITCH'][w];
+    if (w) line += '   ' + ['', 'WARP', 'MMC', 'RE-PITCH'][w];
   } else if (I) line += 'empty instrument (no sample)';
   box.append(el('span', { text: line }));
   if (info.s && !info.noSlice) { const cv = el('canvas', { width: 440, height: 90 }); drawRegion(cv, info.s, info.a, info.b); box.append(cv); }
@@ -4303,7 +4303,7 @@ class WaveView {
       const nb = p.warpBeats;
       g.fillStyle = C.warpGrid;
       for (let b = 1; b < nb; b++) { const x = this.f2x(st + (en - st) * b / nb); if (x > 0 && x < W) g.fillRect(x, 0, 1, H); }
-      g.fillStyle = C.smp; g.fillText((p.warp === 2 ? 'MPC WARP  ' : p.warp === 3 ? 'RE-PITCH  ' : 'WARP  ') + fmtParam({ fmt: 'beats' }, nb), 8, H - 34);
+      g.fillStyle = C.smp; g.fillText((p.warp === 2 ? 'MMC WARP  ' : p.warp === 3 ? 'RE-PITCH  ' : 'WARP  ') + fmtParam({ fmt: 'beats' }, nb), 8, H - 34);
     }
     // markers with flags (flags are the drag handles)
     for (const m of MARKERS) {
@@ -4815,7 +4815,7 @@ async function encodeOpus(chs, kbps) {
   if (desc && desc.length >= 12 && String.fromCharCode(...desc.subarray(0, 8)) === 'OpusHead') preSkip = desc[10] | (desc[11] << 8);
   const head = new Uint8Array(19), hv = new DataView(head.buffer);
   head.set([79, 112, 117, 115, 72, 101, 97, 100]); head[8] = 1; head[9] = nch; hv.setUint16(10, preSkip, true); hv.setUint32(12, 48000, true);
-  const vendor = new TextEncoder().encode('MOBTRACK'), tags = new Uint8Array(16 + vendor.length), tv = new DataView(tags.buffer);
+  const vendor = new TextEncoder().encode('DATTRACK'), tags = new Uint8Array(16 + vendor.length), tv = new DataView(tags.buffer);
   tags.set([79, 112, 117, 115, 84, 97, 103, 115]); tv.setUint32(8, vendor.length, true); tags.set(vendor, 12); tv.setUint32(12 + vendor.length, 0, true);
   const serial = (Math.random() * 4294967295) >>> 0, pages = [oggPage([head], 0, 2, serial, 0), oggPage([tags], 0, 0, serial, 1)];
   let seq = 2, gran = preSkip;
@@ -4880,7 +4880,7 @@ async function exportWav() {
     }
     if (!made.length) { st.textContent = 'Nothing audible to export'; return; }
     const mb = made.reduce((a, f) => a + f.size, 0) / 1048576;
-    st.textContent = (made.length > 1 ? made.length + ' stems' : made[0].name) + '  ' + mb.toFixed(1) + ' MB  (saved to Downloads' + (NATIVE ? '/MOBTRACK' : '') + ')';
+    st.textContent = (made.length > 1 ? made.length + ' stems' : made[0].name) + '  ' + mb.toFixed(1) + ' MB  (saved to Downloads' + (NATIVE ? '/DATTRACK' : '') + ')';
     ui.shareBtn.hidden = made.length > 1 || !(NATIVE || (navigator.canShare && navigator.canShare({ files: [lastWav] })));
   } catch (e) {
     st.textContent = 'Export failed: ' + (e.message || e);
@@ -6120,7 +6120,11 @@ function buildFile() {
     row('MOD', btn('IMPORT .MOD', () => modIn.click(), 'cyan'), btn('EXPORT .MOD', exportModFile, 'amber'),
       el('span', { class: 'fnote', text: 'ProTracker M.K. (4 ch) or 8CHN. Sampler instruments 01-1F only; synths stay silent.' })),
     row('AUTOSAVE', ui.restoreBtn, ui.autoStatus),
-    row('APP', ui.installBtn = btn('INSTALL APP', installApp, 'on'), ui.appStatus = el('span', { class: 'fnote' })));
+    row('APP', ui.installBtn = btn('INSTALL APP', installApp, 'on'), ui.appStatus = el('span', { class: 'fnote' })),
+    row('LICENSES', el('span', { class: 'fnote', text: 'DATTRACK: the tracker, synths, effects, Sample Lab and file encoders are original code. '
+      + 'The Android app also contains AndroidX WebKit and AndroidX Core (Copyright The Android Open Source Project / Google LLC), '
+      + 'licensed under the Apache License, Version 2.0: https://www.apache.org/licenses/LICENSE-2.0 . '
+      + 'Opus audio is encoded by the system browser engine (libopus, BSD license).' })));
   projIn.addEventListener('change', async () => {
     const f = projIn.files[0]; projIn.value = ''; if (!f) return;
     try { setSong(songFromObj(JSON.parse(await f.text()))); toast('Opened ' + f.name); }
@@ -6136,7 +6140,7 @@ function buildFile() {
 let installEvt = null;
 const isInstalledApp = () => !!window.AndroidBridge || matchMedia('(display-mode: fullscreen), (display-mode: standalone)').matches;
 window.addEventListener('beforeinstallprompt', e => { e.preventDefault(); installEvt = e; refreshFile(); });
-window.addEventListener('appinstalled', () => { installEvt = null; toast('MOBTRACK is installed: open it from your app drawer'); refreshFile(); });
+window.addEventListener('appinstalled', () => { installEvt = null; toast('DATTRACK is installed: open it from your app drawer'); refreshFile(); });
 async function installApp() {
   if (!installEvt) return toast('Use the Chrome menu ⋮ → "Install app" (or "Add to Home screen")', 5000);
   installEvt.prompt();
@@ -6146,9 +6150,9 @@ async function installApp() {
 function refreshFile() {
   if (!ui.title) return;
   ui.installBtn.hidden = !installEvt;
-  ui.appStatus.textContent = window.AndroidBridge ? 'Running as the MOBTRACK Android app. Files are saved to Downloads/MOBTRACK.'
+  ui.appStatus.textContent = window.AndroidBridge ? 'Running as the DATTRACK Android app. Files are saved to Downloads/DATTRACK.'
     : isInstalledApp() ? 'Running as an installed app (works offline).'
-    : installEvt ? 'Install MOBTRACK as an app: own icon, full screen, works offline.'
+    : installEvt ? 'Install DATTRACK as an app: own icon, full screen, works offline.'
     : location.protocol === 'https:' ? 'To install: Chrome menu ⋮ → "Install app" or "Add to Home screen".'
     : 'Open the web version (https) in Chrome to install it as an app.';
   if (document.activeElement !== ui.title) ui.title.value = song.title;
@@ -6269,7 +6273,7 @@ function frame() {
 // =====================================================================
 // 13. HELP + BOOT
 // =====================================================================
-$('#helptext').innerHTML = `<b>MOBTRACK — quick reference</b>   (tap anywhere to close)
+$('#helptext').innerHTML = `<b>DATTRACK — quick reference</b>   (tap anywhere to close)
 
 <b>PATTERN</b>  tap a cell to move the cursor · drag to scroll · track header: M = mute, S = solo
  Cell:  NOTE  INS  VOL  FX PARAM  LEN  AUTO  SWG     e.g.  C-4 01 40 A0F 04 80 20     (VIEW: FULL / NORMAL / COMPACT)
@@ -6316,7 +6320,7 @@ $('#helptext').innerHTML = `<b>MOBTRACK — quick reference</b>   (tap anywhere 
 
 <b>UNDO / REDO</b> (top bar) undo everything: pattern edits, values, sample edits, presets, instruments, order list.
  WARP page: OFF = classic (pitch changes speed). BEATS = time-stretch: START..END always lasts BEATS beats at the
-   song tempo (4 rows = 1 beat), notes change pitch only. MPC = old MPC-style stretch: hard-edged grains, gritty
+   song tempo (4 rows = 1 beat), notes change pitch only. MMC = old-sampler-style stretch: hard-edged grains, gritty
    and stuttery (bigger GRAIN = choppier). RE-PITCH = tempo-synced by speed: faster tempo = higher pitch, like a
    record (no grain artifacts). FIT TO TEMPO guesses BEATS from the length. Follows BPM and Fxx.
  SLICE page: EQUAL or DETECT (transients) → KEYS (slice n plays at ROOT+n) or → INSTRS (one instrument per slice)
