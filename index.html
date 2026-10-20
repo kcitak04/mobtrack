@@ -2546,13 +2546,14 @@ const AUTO_MIX = {
   f: ['revPre', 'revRet', 'dlyFb', 'dlyDamp', 'dlyRet'],
 };
 function findPd(list, key) { for (const x of list) { if (x.params) { const d = findPd(x.params, key); if (d) return d; } else if (x.key === key) return x; } return null; }
+const AUTO_LEN_KEYS = new Set(['sStart', 'sEnd']);   // sample-length params that can be automated
 function autoResolve(tgt) {
   if (!tgt) return null;
   const [kind, id, key] = tgt.split(':'), idx = +id;
   if (kind === 'i') {
     const ins = song.instruments[idx]; if (!ins) return null;
     const pd = findPd(INSTRUMENT_TYPES[ins.type].pages, key) || (key.startsWith('ifx') ? findPd(instFxParams(ins, 1).concat(instFxParams(ins, 2)), key) : null);
-    return pd && pd.max !== 'len' ? { kind, idx, key, pd, obj: ins.p, ins, label: hex(idx) + ' ' + (ins.name || INSTRUMENT_TYPES[ins.type].label) + ' › ' + pd.label } : null;
+    return pd && (pd.max !== 'len' || AUTO_LEN_KEYS.has(key)) ? { kind, idx, key, pd, obj: ins.p, ins, label: hex(idx) + ' ' + (ins.name || INSTRUMENT_TYPES[ins.type].label) + ' › ' + pd.label } : null;
   }
   if (!AUTO_MIX[kind] || !AUTO_MIX[kind].includes(key)) return null;
   if (kind === 't') {
@@ -2562,8 +2563,9 @@ function autoResolve(tgt) {
   const pd = findPd(kind === 'm' ? MASTER_PARAMS.concat(masterFxParams(1), masterFxParams(2)) : REV_PARAMS.concat(DLY_PARAMS), key);
   return pd ? { kind, idx: 0, key, pd, obj: kind === 'm' ? song.master : song.fx, label: (kind === 'm' ? 'MASTER' : 'FX') + ' › ' + pd.label } : null;
 }
-const autoValue = (r, raw) => fromNorm(r.pd, raw / 255, pMax(r.pd, r.ins));
-const autoRaw = r => Math.round(clamp(toNorm(r.pd, r.obj[r.key], pMax(r.pd, r.ins)), 0, 1) * 255);
+// END 0 means "whole sample" for a sampler, so automated END never goes below 1 (the voice keeps it 2 frames past START)
+const autoValue = (r, raw) => { const v = fromNorm(r.pd, raw / 255, pMax(r.pd, r.ins)); return r.key === 'sEnd' ? Math.max(1, v) : v; };
+const autoRaw = r => r.key === 'sEnd' && !(r.obj.sEnd > 0) ? 255 : Math.round(clamp(toNorm(r.pd, r.obj[r.key], pMax(r.pd, r.ins)), 0, 1) * 255);
 const autoPending = [];   // realtime: model updates applied when the change becomes audible (keeps the UI in sync)
 // Player 'auto' events -> timed instrument param events (worklet) or AudioParam automation (mixer)
 function routeAuto(evs, mixer, live) {
@@ -2663,6 +2665,7 @@ class Instrument {
 class Song {
   constructor() {
     this.title = 'UNTITLED'; this.bpm = 125; this.speed = 6;
+    this.rowDiv = 16;   // step length: one row is a 1/rowDiv note (1/16 = the classic grid, 4 rows = 1 beat)
     this.patterns = [new Pattern(64)]; this.order = [0];
     this.instruments = [null];
     for (let i = 1; i <= MAX_INST; i++) this.instruments.push(new Instrument());
@@ -2688,7 +2691,8 @@ function unb64(str, T) { const bin = atob(str), u8 = new Uint8Array(bin.length);
 function songToObj(raw) {
   const enc = raw ? (a => a) : b64, s = song;
   return {
-    format: 'mobtrack', version: 3,   // internal format tag (kept from the app's first name so all old projects still open) title: s.title, bpm: s.bpm, speed: s.speed, order: s.order.slice(),
+    format: 'mobtrack', version: 3,   // internal format tag (kept from the app's first name so all old projects still open)
+    title: s.title, bpm: s.bpm, speed: s.speed, rowDiv: rowDivOf(s), order: s.order.slice(),
     patterns: s.patterns.map(p => ({ rows: p.rows, data: enc(p.data) })),
     instruments: s.instruments.slice(1).map(i => ({ type: i.type, name: i.name, preset: i.preset || '', sampleId: i.sampleId, slices: i.slices.slice(), p: Object.assign({}, i.p) })),
     samples: [...s.samples.values()].filter(x => s.instruments.some(i => i && i.sampleId === x.id)).map(x => ({ id: x.id, sr: x.sr, name: x.name, ch: x.ch.map(enc) })),
@@ -2700,6 +2704,7 @@ function songFromObj(o) {
   const dec = (v, T) => typeof v === 'string' ? unb64(v, T) : new T(v);
   const s = new Song();
   s.title = String(o.title || 'UNTITLED').slice(0, 20); s.bpm = clamp(o.bpm | 0 || 125, 32, 255); s.speed = clamp(o.speed | 0 || 6, 1, 31);
+  s.rowDiv = ROW_DIVS.includes(o.rowDiv | 0) ? o.rowDiv | 0 : 16;
   s.patterns = o.patterns.slice(0, MAX_PATTERNS).map(pp => {
     const p = new Pattern(clamp(pp.rows | 0, 16, 256)), d = dec(pp.data, Int16Array), cells = p.rows * TRACKS;
     if (d.length === p.data.length) p.data.set(d);
@@ -2952,7 +2957,7 @@ class Mixer {
     if (this.ping !== !!f.dlyPing) this.wireDelay(!!f.dlyPing);
     this.setTempo(this.bpm, this.speed, null, inst);
   }
-  // delay time follows the tracker tempo (4 rows = 1 beat); called on BPM/speed changes incl. Fxx during playback
+  // delay time follows the tempo (DLY_ROWS are 1/16 notes, whatever the step length); called on BPM/speed changes incl. Fxx during playback
   setTempo(bpm, speed, t, inst) {
     this.bpm = bpm; this.speed = speed;
     if (this.engine) this.engine.schedule([{ t: t != null ? t : 0, k: 'tempo', bpm, speed }]);   // WARP samples follow tempo too
@@ -3038,6 +3043,12 @@ class AudioEngine {
   }
 }
 
+// ---- step length: one row = 1/rowDiv note. BPM is always the real tempo; at 1/16 (the default) 4 rows = 1 beat ----
+const ROW_DIVS = [4, 8, 16, 32, 64];
+const rowDivOf = s => ROW_DIVS.includes(s && s.rowDiv) ? s.rowDiv : 16;
+const rowScale = (s = song) => 16 / rowDivOf(s);      // one row in 1/16 notes
+const rowsPerBeat = (s = song) => rowDivOf(s) / 4;    // 1 (1/4) .. 16 (1/64)
+
 // =====================================================================
 // 4. PLAYER (ProTracker-style replayer, pure logic, tick-based)
 // Produces time-stamped events; knows nothing about real time, so the same
@@ -3076,7 +3087,7 @@ class Player {
     for (const c of this.ch) c.reset();
   }
   patObj() { return this.song.patterns[this.pat] || this.song.patterns[0]; }
-  get tickDur() { return 2.5 / this.bpm; }
+  get tickDur() { return 2.5 / this.bpm * rowScale(this.song); }   // shorter ticks for a finer step length, same BPM
   step(time, evs) {
     let info = null;
     if (this.tick === 0) {
@@ -3086,8 +3097,9 @@ class Player {
         this.visited.add(key);
       }
       info = { order: this.order, pat: this.pat, row: this.row };
-      // metronome (live playback only): every beat = 4 rows, accent on each bar of 16 rows
-      if (this.metro && this.row % 4 === 0) evs.push({ t: time, k: 'click', ch: -1, accent: this.row % 16 === 0 });
+      // metronome (live playback only): every beat (4 rows at 1/16), accent on each bar
+      const rpb = rowsPerBeat(this.song);
+      if (this.metro && this.row % rpb === 0) evs.push({ t: time, k: 'click', ch: -1, accent: this.row % (rpb * 4) === 0 });
       this.doRow(time, evs);
       if (this.bpm !== this.lastBpm || this.speed !== this.lastSpeed) {
         this.lastBpm = this.bpm; this.lastSpeed = this.speed; this.tempoEv.push({ t: time, bpm: this.bpm, speed: this.speed });
@@ -3653,8 +3665,8 @@ class NumBox {
   }
   openInput() {
     const { min, max } = this.o;
-    openValueInput({ label: this.label, value: String(this.get()), hint: min + ' – ' + max, neg: min < 0, def: this.o.def,
-      parse: s => { const n = Math.round(parseFloat(s)); return isFinite(n) ? clamp(n, min, max) : null; },
+    openValueInput({ label: this.label, value: this.o.parse ? this.o.fmt(this.get()) : String(this.get()), hint: this.o.hint || min + ' – ' + max, neg: min < 0, def: this.o.def,
+      parse: this.o.parse || (s => { const n = Math.round(parseFloat(s)); return isFinite(n) ? clamp(n, min, max) : null; }),
       onSet: v => { this.begin(); this.apply(v); this.end(); } });
   }
   // undo: o.hist = label records a value change; o.begin() lets the owner snapshot something itself
@@ -3929,7 +3941,8 @@ class PatternView {
     g.save(); g.beginPath(); g.rect(nx, top, W - nx, H - top); g.clip();
     for (let r = r0; r <= r1; r++) {
       const y = top + (r - sy) * rh;
-      let bg = r % 16 === 0 ? C.row16 : r % 4 === 0 ? C.row4 : null;
+      const rpb = rowsPerBeat();
+      let bg = r % (rpb * 4) === 0 ? C.row16 : r % rpb === 0 ? C.row4 : null;
       if (r === state.row) bg = C.curRow;
       if (r === play) bg = C.playRow;
       if (bg) { g.fillStyle = bg; g.fillRect(nx, y, W - nx, rh); }
@@ -3956,7 +3969,7 @@ class PatternView {
     for (let r = r0; r <= r1; r++) {
       const y = top + (r - sy) * rh;
       if (r === play || r === state.row) { g.fillStyle = r === play ? C.playRow : C.curRow; g.fillRect(0, y, nx, rh); }
-      g.fillStyle = r % 4 === 0 ? C.numHi : C.num;
+      g.fillStyle = r % rowsPerBeat() === 0 ? C.numHi : C.num;
       g.fillText(hex(r), 5, y + rh / 2 + 1);
     }
     // track headers + VU
@@ -5019,7 +5032,9 @@ function exportMOD() {
   for (const pi of pats) {
     const p = song.patterns[pi], rows = Math.min(64, p.rows), lastIns = new Array(nch).fill(1);
     if (p.rows > 64) warn.add('rows beyond 64 are cut');
-    if (song.speed !== 6 || song.bpm !== 125) warn.add('add F' + hex(song.speed) + '/F' + hex(song.bpm) + ' to the first row to keep the tempo');
+    const modBpm = Math.round(song.bpm * rowDivOf(song) / 16);   // MOD rows have no step length: the tick rate carries it
+    if (modBpm < 32 || modBpm > 255) warn.add('step length 1/' + rowDivOf(song) + ' at ' + song.bpm + ' BPM cannot be kept (MOD tempo 32-255)');
+    else if (song.speed !== 6 || modBpm !== 125) warn.add('add F' + hex(song.speed) + '/F' + hex(modBpm) + ' to the first row to keep the tempo');
     for (let r = 0; r < rows; r++) for (let t = 0; t < nch; t++) {
       const o = p.i(r, t), d = p.data, q = off + (r * nch + t) * 4, v = d[o + 2];
       let n = d[o], ins = d[o + 1], fx = d[o + 3], pa = Math.max(0, d[o + 4]), per = 0;
@@ -5130,6 +5145,9 @@ function buildTop() {
   top.append(el('div', { class: 'sep' }));
   const tempo = () => { markDirty(); if (engine.ready) engine.mixer.setTempo(sched.playing ? player.bpm : song.bpm, sched.playing ? player.speed : song.speed); };
   top.append(new NumBox('BPM', () => song.bpm, v => { song.bpm = v; if (sched.playing) player.bpm = v; tempo(); }, { min: 32, max: 255, px: 4, hist: 'BPM' }).el);
+  top.append(new NumBox('ROW', () => ROW_DIVS.indexOf(rowDivOf(song)), v => { song.rowDiv = ROW_DIVS[v]; markDirty(); patView.dirty = true; },
+    { min: 0, max: ROW_DIVS.length - 1, px: 24, hist: 'step length', fmt: v => '1/' + ROW_DIVS[v],
+      parse: t => { const n = parseInt(String(t).replace(/^\s*1\s*\//, ''), 10), i = ROW_DIVS.indexOf(n); return i >= 0 ? i : null; }, hint: '1/4 1/8 1/16 1/32 1/64' }).el);
   top.append(new NumBox('OCT', () => state.octave, v => { state.octave = v; refreshPad(); }, { min: 0, max: 8, px: 20 }).el);
   top.append(new NumBox('STEP', () => state.step, v => state.step = v, { min: 0, max: 16, px: 14 }).el);
   top.append(el('div', { class: 'sep' }));
@@ -5373,7 +5391,7 @@ function fillTargets() {
   if (m && +m[1] !== state.inst) ids.push(+m[1]);
   for (const id of ids) {
     const ins = song.instruments[id], items = [];
-    for (const pg of INSTRUMENT_TYPES[ins.type].pages) for (const pd of pg.params || []) if (pd.max !== 'len') items.push(['i:' + id + ':' + pd.key, pg.name + ' ' + pd.label]);
+    for (const pg of INSTRUMENT_TYPES[ins.type].pages) for (const pd of pg.params || []) if (pd.max !== 'len' || AUTO_LEN_KEYS.has(pd.key)) items.push(['i:' + id + ':' + pd.key, pg.name + ' ' + pd.label]);
     for (const slot of [1, 2]) for (const pd of instFxParams(ins, slot).slice(1)) items.push(['i:' + id + ':' + pd.key, 'FX' + slot + ' ' + FX_TYPES[ins.p['ifx' + slot + 'Type'] | 0].name + ' ' + pd.label]);
     group('INST ' + hex(id) + ' ' + (ins.name || INSTRUMENT_TYPES[ins.type].label), items);
   }
@@ -5399,7 +5417,7 @@ function refreshDial() {
     txt = !kit.length ? 'kit is empty: + ADD a sample' : di.raw < 0 ? '.. (next: ' + hex(kitSlot(state.track)) + ' ' + nm(kitSlot(state.track)) + ')' : hex(di.raw) + ' = ' + nm(di.raw) + '   [' + kit.length + ' in kit]';
   }
   else if (di.swg) {
-    const ms = raw => Math.round(raw / 256 * song.speed * 2.5 / song.bpm * 1000);
+    const ms = raw => Math.round(raw / 256 * song.speed * 2.5 / song.bpm * rowScale() * 1000);
     txt = di.raw < 0 ? '.. (on time)' : hex(di.raw) + ' = ' + Math.round(di.raw / 256 * 100) + '% of a row late (' + ms(di.raw) + ' ms)';
   }
   else if (di.auto) txt = !di.r ? 'pick a target →' : di.raw < 0 ? '.. (now ' + fmtParam(di.r.pd, di.r.obj[di.r.key], di.r.ins) + ')' : hex(di.raw) + ' = ' + fmtParam(di.r.pd, autoValue(di.r, di.raw), di.r.ins);
@@ -5537,7 +5555,7 @@ function renderParams() {
     return;
   }
   for (const pd of pg.params) { const pb = new ParamBox(pd); paramBoxes.push(pb); box.append(pb.el); }
-  if (pg.name === 'WARP') box.append(btn('FIT TO TEMPO', fitWarp, 'amber'), el('div', { class: 'btn', style: 'color:var(--dim)', text: '1 beat = 4 rows' }));
+  if (pg.name === 'WARP') box.append(btn('FIT TO TEMPO', fitWarp, 'amber'), el('div', { class: 'btn', style: 'color:var(--dim)', text: '1 beat = 1/4 note' }));
 }
 function refreshParams() {
   if ($('#ipage').dataset.type !== curInst().type) return renderParams();   // boxes belong to another instrument type
@@ -5774,7 +5792,7 @@ function refreshRs() {
   const rs = state.rs;
   ui.rsBoxes.forEach(b => b.refresh());
   ui.rsBoxes[1].el.classList.toggle('off', rs.src === 0);   // track signal only matters for a track
-  const rows = rsRangeRows(), secs = rows * song.speed * 2.5 / song.bpm;
+  const rows = rsRangeRows(), secs = rows * song.speed * 2.5 / song.bpm * rowScale();
   const what = rs.src ? 'TRACK ' + rs.src + ' (' + ['dry', 'with insert/EQ/comp', 'with sends'][rs.tap] + ')' : 'MASTER';
   const range = rs.range === 0 ? 'pattern ' + hex(curPatIndex()) : rs.range === 1 ? 'whole song' : rows ? 'rows ' + hex(selRect(false).r0) + '-' + hex(selRect(false).r1) : 'no rows selected';
   const dest = rs.dest ? 'instrument ' + hex(state.inst) + ' (replaced)' : (freeInst() ? 'new instrument ' + hex(freeInst()) : 'no free instrument!');
@@ -6279,13 +6297,17 @@ $('#helptext').innerHTML = `<b>DATTRACK — quick reference</b>   (tap anywhere 
  Cell:  NOTE  INS  VOL  FX PARAM  LEN  AUTO  SWG     e.g.  C-4 01 40 A0F 04 80 20     (VIEW: FULL / NORMAL / COMPACT)
  SWG  = swing / microtiming: this row plays late by SWG/256 of a row on this track (40 = a quarter row, 80 = half).
         Dial it like LEN/AUTO; e.g. put 30-50 on every second row for a shuffle. Visible in the FULL view.
- BPM  = real tempo (4 rows = 1 beat). METRO clicks every beat (accent each 16 rows) while playing, never in exports.
+ BPM  = real tempo. ROW = step length: what one row is worth, 1/4 1/8 1/16 1/32 or 1/64 (1/16 = 4 rows per beat;
+        1/64 = 16 rows per beat for finer notes and automation at the same BPM). Saved with the song.
+        METRO clicks every beat (accent each bar) while playing, never in exports.
  LEN  = note length in rows (note-off after N rows). The LEN box on the piano pad writes it with every new note.
  AUTO = automation value 00-FF for the track's target. On the LEN/AUTO columns the pad becomes a dial:
         drag the big slider to write the value on this row (you hear it right away); pick the target in the list.
         Hold the slider while playing (EDIT + FOLLOW) to record automation live. SEL + INTERP draws ramps.
         There are 4 automation lanes per row, each with its own target per track: tap the "AUTO n/4 ▸" title
         on the dial to switch which lane the AUTO column shows.
+        Sampler START and END are automation targets too (00 = start of the sample, FF = its end): each new note
+        plays the part they set, so a lane can scan through a sample or chop it.
  HOLD a note (or a sample slot) still for 1.5 s: a box shows which instrument, sample, slice and region it plays.
  The same works on the piano keys: hold a key 1.5 s to see what that key plays right now (time: PREF → INFO HOLD).
  Note field → piano pad (edit mode writes note + current instrument).  Other fields → hex pad.
@@ -6320,7 +6342,7 @@ $('#helptext').innerHTML = `<b>DATTRACK — quick reference</b>   (tap anywhere 
 
 <b>UNDO / REDO</b> (top bar) undo everything: pattern edits, values, sample edits, presets, instruments, order list.
  WARP page: OFF = classic (pitch changes speed). BEATS = time-stretch: START..END always lasts BEATS beats at the
-   song tempo (4 rows = 1 beat), notes change pitch only. MMC = old-sampler-style stretch: hard-edged grains, gritty
+   song tempo (BPM), notes change pitch only. MMC = old-sampler-style stretch: hard-edged grains, gritty
    and stuttery (bigger GRAIN = choppier). RE-PITCH = tempo-synced by speed: faster tempo = higher pitch, like a
    record (no grain artifacts). FIT TO TEMPO guesses BEATS from the length. Follows BPM and Fxx.
  SLICE page: EQUAL or DETECT (transients) → KEYS (slice n plays at ROOT+n) or → INSTRS (one instrument per slice)
@@ -6338,7 +6360,7 @@ $('#helptext').innerHTML = `<b>DATTRACK — quick reference</b>   (tap anywhere 
  (+ FX MIX).  Master strip: 2 INSERT slots with the same effects, EQ, comp, limiter.
  MASTER FADER (right edge): drag the fader, double-tap = 0 dB, tap the dB readout to type a level. Stereo meter.
  Every instrument (sampler and synths) also has an FX page with 2 slots of the same effects.
- Delay time is synced to BPM/speed (4 rows = 1 beat) and follows Fxx changes.
+ Delay time is synced to the tempo (BPM, note values) and follows Fxx changes.
 
 <b>RSMP</b>  resample the MASTER or one TRACK (DRY / +INSERT/EQ / +SENDS) over the PATTERN, SONG or SELECTED rows
  into a sample: TAIL keeps release/echo (0 = exact loop length), NORMALIZE, AUTO WARP (stays in tempo), LOOP,
