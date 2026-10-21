@@ -6241,13 +6241,16 @@ document.addEventListener('keyup', e => { const k = e.key.toLowerCase(); if (key
 // =====================================================================
 // 12. MAIN LOOP (playhead + meters)
 // =====================================================================
+// the context time being heard right now (drives the playhead / FOLLOW). The output timestamp is the precise answer,
+// but on some devices it goes stale or drifts after playing for a while, and the playhead then falls further and further
+// behind the sound: never trust it beyond the output latency the context reports
 function audibleTime() {
-  const ctx = engine.ctx;
+  const ctx = engine.ctx, now = ctx.currentTime, lat = Math.min(0.5, ctx.outputLatency ? ctx.outputLatency + (ctx.baseLatency || 0) : ctx.baseLatency || 0);
   if (ctx.getOutputTimestamp) {
     const ts = ctx.getOutputTimestamp();
-    if (ts.contextTime > 0 && ts.performanceTime > 0) return ts.contextTime + (performance.now() - ts.performanceTime) / 1000;
+    if (ts.contextTime > 0 && ts.performanceTime > 0) return Math.min(now, Math.max(now - lat - 0.08, ts.contextTime + (performance.now() - ts.performanceTime) / 1000));
   }
-  return ctx.currentTime - (ctx.outputLatency || ctx.baseLatency || 0);
+  return now - lat;
 }
 let vuActive = false, frameN = 0;
 function frame() {
